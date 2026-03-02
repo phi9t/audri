@@ -1,0 +1,48 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: megatronlm
+  description: "NVIDIA Megatron-Core distributed training on Zephyr Spack base"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: default
+      packages:
+        - "megatron-core>=0.15.2"
+        # [core] installs transformer_engine_cu12 (pre-built wheel).
+        # [pytorch] requires GPU at build time (CUDA lib + pybind11 compilation).
+        # snapshot_mlsys.sh --gpu-finalize installs it post-build via docker run.
+        - "transformer-engine[core]"
+        - "tensorboard"
+        - "networkx"
+      overrides:
+        - llm_serving_overrides.txt
+  validation:
+    provenance:
+      spack:
+        - torch
+        - numpy
+        - triton
+      uv:
+        # megatron-core skipped: module name is 'megatron' not 'megatron_core',
+        # and import triggers transformer_engine which needs GPU.
+        # Provenance verified by GPU functional test (megatron_import).
+        - tensorboard
+    no_nvidia_pip: true
+    gpu_functional:
+      - name: megatron_import
+        script: |
+          import torch
+          import importlib.metadata as md
+          assert torch.cuda.is_available(), 'CUDA not available'
+          assert torch.distributed.is_available(), 'distributed not available'
+          print(f'megatron-core {md.version("megatron-core")} OK')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+          - "libcusparse"
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

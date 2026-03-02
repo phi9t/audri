@@ -1,0 +1,42 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: torchtitan
+  description: "TorchTitan distributed training on Zephyr Spack base"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: default
+      packages:
+        # torchtitan is run from source (PyPI stub has no code).
+        # This venv provides runtime deps: tensorboard, tomli-w, etc.
+        - "tensorboard"
+        - "tomli-w"
+        - "datasets>=2.0"
+      overrides: []
+  validation:
+    provenance:
+      spack:
+        - torch
+        - torchvision
+        - torchaudio
+        - numpy
+        - triton
+      uv:
+        - tensorboard
+    no_nvidia_pip: true
+    gpu_functional:
+      - name: torch_distributed_check
+        script: |
+          import torch
+          assert torch.cuda.is_available(), 'CUDA not available'
+          assert torch.distributed.is_available(), 'distributed not available'
+          print(f'torch distributed OK — torchtitan deps ready')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

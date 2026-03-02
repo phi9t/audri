@@ -1,0 +1,44 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: sglang
+  description: "sglang inference serving on Zephyr Spack base"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: default
+      packages:
+        - "sglang>=0.5.8"
+        - "pybase64"
+        - "pydantic"
+        - "fastapi"
+        - "uvicorn"
+        - "zmq"
+      overrides:
+        - llm_serving_overrides.txt
+  validation:
+    provenance:
+      spack:
+        - torch
+        - triton
+        - numpy
+      uv:
+        - sglang
+    no_nvidia_pip: true
+    gpu_functional:
+      - name: sglang_import
+        script: |
+          import torch, triton
+          assert torch.cuda.is_available(), 'CUDA not available'
+          import sglang
+          print(f'sglang {sglang.__version__}')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+          - "libcusparse"
+          - "triton"
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

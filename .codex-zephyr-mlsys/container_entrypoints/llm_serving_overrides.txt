@@ -1,0 +1,81 @@
+# =============================================================================
+# UV overrides for LLM serving packages (vLLM, sglang, megatron-core, etc.)
+# =============================================================================
+#
+# This file is passed to uv via --override (e.g. in MLSys image builds or
+# uv pip compile).  It customizes resolution so that Spack-provided packages
+# are accepted by the resolver even when upstream PyPI metadata pins disagree.
+#
+# -----------------------------------------------------------------------------
+# UV resolution concepts (how overrides work)
+# -----------------------------------------------------------------------------
+#
+# Resolution: uv turns a list of requirements (direct + transitive) into a set
+# of concrete package versions.  It must satisfy every package's declared
+# dependencies; conflicting declarations can make resolution fail.
+#
+# Overrides (this file): Replace a package's *declared* requirements with the
+# override spec.  Unlike constraints (which only narrow allowed versions),
+# overrides can *widen* allowed versions or use *impossible markers* to
+# effectively remove a dependency from the resolution.
+#
+# - Relaxation: e.g. "torchvision>=0.20.0; sys_platform == 'linux'" means
+#   "when resolving on Linux, ignore whatever vLLM/sglang declared for
+#   torchvision and allow any version >= 0.20.0".  The resolver can then
+#   accept the environment's version (e.g. from Spack view via .pth) instead
+#   of insisting on an exact pin that would pull a duplicate from PyPI.
+#
+# - Blocking: e.g. "torch>=2.9.0; sys_platform == 'never'" uses a marker that
+#   is never true.  So the override applies in no environment; uv does not
+#   add a pip-installed torch.  The real torch comes from Spack (view) and
+#   is visible at runtime via .pth / PYTHONPATH.
+#
+# Markers: PEP 508 environment markers (e.g. sys_platform == 'linux') restrict
+# when the override applies.  We use sys_platform == 'linux' for relaxations
+# (LLM serving runs in Linux containers) and sys_platform == 'never' to block
+# a package entirely.
+#
+# Reference: https://docs.astral.sh/uv/concepts/resolution/#overrides
+#
+# -----------------------------------------------------------------------------
+# Why we need this (Spack + uv layering)
+# -----------------------------------------------------------------------------
+#
+# Spack builds PyTorch, triton, numpy, etc. and exposes them in a view; the
+# venv sees them via --system-site-packages and a .pth file.  At runtime the
+# interpreter loads those Spack-built binaries.  Upstream LLM packages (vLLM,
+# sglang, megatron-core) declare exact or narrow pins on PyPI.  If we didn't
+# override, uv would either fail (incompatible pins) or install duplicate
+# pip copies.  Overrides let the resolver accept "any compatible version" on
+# Linux so that the already-present Spack versions satisfy the dependency
+# graph; no duplicate install, and runtime uses Spack's compiled stack.
+#
+# See: https://docs.astral.sh/uv/concepts/resolution/#overrides
+
+# Relax torchvision pin (vLLM pins exact versions per release)
+torchvision>=0.20.0; sys_platform == 'linux'
+
+# Relax torchaudio pin (sglang pins exact versions)
+torchaudio>=2.9.0; sys_platform == 'linux'
+
+# Relax numba pin (vLLM 0.11.1+ pins 0.61.2/0.62.0rc2)
+numba>=0.60.0; sys_platform == 'linux'
+
+# Relax triton pin (torch 2.9.0 PyPI metadata requires triton==3.5.0,
+# but Spack compiled torch against triton 3.4.0 -- runtime is fine)
+triton>=3.4.0; sys_platform == 'linux'
+
+# Relax soundfile pin (sglang pins 0.13.1, Spack has 0.10.3.post1)
+soundfile>=0.10.0; sys_platform == 'linux'
+
+# Relax outlines-core pin (outlines 0.1.11 pins ==0.1.26 which lacks
+# Python 3.13 wheels; >=0.2.0 has cp313 pre-built wheels)
+outlines-core>=0.1.26; sys_platform == 'linux'
+
+# Relax numpy pin (megatron-core pins <2.0.0, Spack has 2.3.4 — runtime is fine)
+numpy>=2.0.0; sys_platform == 'linux'
+
+# Block pip torch entirely (must come from Spack).
+# sys_platform == 'never' => override applies in no environment => no pip torch;
+# runtime uses Spack view torch via .pth.
+torch>=2.9.0; sys_platform == 'never'

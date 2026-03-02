@@ -1,0 +1,67 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: llm-serving-all
+  description: "Unified LLM serving: vLLM + sglang + HF transformers in separate venvs"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: hf
+      packages:
+        - "transformers"
+        - "tokenizers"
+        - "accelerate"
+      overrides: []
+    - name: vllm
+      packages:
+        - "vllm>=0.15.0"
+        - "networkx"
+      overrides:
+        - llm_serving_overrides.txt
+    - name: sglang
+      packages:
+        - "sglang>=0.5.8"
+        - "pybase64"
+        - "pydantic"
+        - "fastapi"
+        - "uvicorn"
+        - "zmq"
+      overrides:
+        - llm_serving_overrides.txt
+  validation:
+    provenance:
+      spack:
+        - torch
+        - triton
+        - numpy
+      uv:
+        - transformers
+        - vllm
+        - sglang
+    no_nvidia_pip: true
+    gpu_functional:
+      - name: vllm_import
+        script: |
+          import torch
+          assert torch.cuda.is_available(), 'CUDA not available'
+          import vllm
+          print(f'vllm {vllm.__version__}')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+          - "libcusparse"
+      - name: sglang_import
+        script: |
+          import torch, triton
+          assert torch.cuda.is_available(), 'CUDA not available'
+          import sglang
+          print(f'sglang {sglang.__version__}')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+          - "libcusparse"
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

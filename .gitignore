@@ -1,0 +1,25 @@
+# Python venvs built by UV (under /workspace inside container)
+.venv*/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# UV / pip cache
+.uv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local outputs (generated at runtime)
+outputs/
+runs/
+
+# Local session / scratch files
+session-*.md
+audri-firt-steps.txt
+progress.codex.org

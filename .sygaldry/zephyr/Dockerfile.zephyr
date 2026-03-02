@@ -1,0 +1,17 @@
+# Repo-derived Zephyr image.
+# Edit this file in the target repo to add repo-specific packages or tools.
+
+ARG BASE_IMAGE_REF
+FROM ${BASE_IMAGE_REF}
+
+ARG BASE_IMAGE_REF
+ARG REPO_SOURCE_REV=unknown
+ARG REPO_IMAGE_CREATED_AT=unknown
+
+LABEL sygaldry.derived_image="true" \
+      sygaldry.base_image_ref="${BASE_IMAGE_REF}" \
+      sygaldry.repo_source_rev="${REPO_SOURCE_REV}" \
+      sygaldry.repo_image_created_at="${REPO_IMAGE_CREATED_AT}"
+
+# Keep the same runtime contract and entrypoints as the base Zephyr image.
+# Add only repo-specific layers below.

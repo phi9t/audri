@@ -1,0 +1,39 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: vllm
+  description: "vLLM inference serving on Zephyr Spack base"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: default
+      packages:
+        - "vllm>=0.15.0"
+        - "networkx"
+      overrides:
+        - llm_serving_overrides.txt
+  validation:
+    provenance:
+      spack:
+        - torch
+        - triton
+        - numpy
+      uv:
+        - vllm
+    no_nvidia_pip: true
+    gpu_functional:
+      - name: vllm_import
+        script: |
+          import torch
+          assert torch.cuda.is_available(), 'CUDA not available'
+          import vllm
+          print(f'vllm {vllm.__version__}')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+          - "libcusparse"
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

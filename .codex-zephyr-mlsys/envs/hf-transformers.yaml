@@ -1,0 +1,54 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: hf-transformers
+  description: "HuggingFace transformers + tokenizers + accelerate on Zephyr Spack base"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: default
+      packages:
+        - "transformers"
+        - "tokenizers"
+        - "accelerate"
+      overrides: []
+  validation:
+    provenance:
+      spack:
+        - torch
+        - torchvision
+        - torchaudio
+        - numpy
+        - scipy
+        - triton
+      uv:
+        - transformers
+        - tokenizers
+        - accelerate
+    no_nvidia_pip: true
+    gpu_functional:
+      - name: torch_cuda
+        script: |
+          import torch
+          assert torch.cuda.is_available(), 'CUDA not available'
+          a = torch.randn(64, 64, device='cuda')
+          b = torch.randn(64, 64, device='cuda')
+          c = torch.matmul(a, b)
+          assert c.shape == (64, 64)
+          print('torch CUDA OK')
+        hard_fail_patterns:
+          - "undefined symbol"
+          - "libnvJitLink"
+          - "libcusparse"
+      - name: hf_tokenizer
+        script: |
+          from transformers import AutoTokenizer, AutoModel
+          from tokenizers import Tokenizer
+          import accelerate
+          print(f'transformers + tokenizers + accelerate OK')
+        hard_fail_patterns: []
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

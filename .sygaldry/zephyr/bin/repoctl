@@ -1,0 +1,196 @@
+#!/bin/bash
+set -eu -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+KIT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly KIT_ROOT
+
+readonly LAUNCHER="${KIT_ROOT}/container/launch_container.sh"
+readonly VERIFY_UV_LAYERING="${KIT_ROOT}/container/verify_uv_layering.sh"
+readonly BUILD_REPO_IMAGE="${KIT_ROOT}/build_repo_image.sh"
+readonly CONFIG_PATH="${ZEPHYR_INFRA_CONFIG:-${KIT_ROOT}/infra.yaml}"
+
+# shellcheck disable=SC1091
+source "${KIT_ROOT}/lib/infra_config.sh"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  repoctl shell [--repo <path>] [launcher args...]
+  repoctl run   [--repo <path>] -- <command>
+  repoctl image build [--repo <path>] [--no-cache] [--runtime-image <tag>]
+  repoctl verify spack [--repo <path>]
+  repoctl verify uv-layering [--no-gpu] [--with-vllm]
+  repoctl verify image [--repo <path>] [--skip-spack]
+  repoctl config show [--repo <path>]
+  repoctl env
+
+Notes:
+- Uses .sygaldry/zephyr/infra.yaml (or ZEPHYR_INFRA_CONFIG) for pinned image and defaults.
+- Supports image modes: standard | auto | derived.
+- Enforces digest-pinned image_ref and base_image_ref policy.
+USAGE
+}
+
+resolve_repo_root() {
+    if command -v git >/dev/null 2>&1; then
+        git rev-parse --show-toplevel 2>/dev/null || pwd
+    else
+        pwd
+    fi
+}
+
+extract_repo_arg() {
+    local -n args_ref=$1
+    REPO_ARG=""
+    local i=0
+    while [[ ${i} -lt ${#args_ref[@]} ]]; do
+        case "${args_ref[${i}]}" in
+            --repo)
+                [[ $((i + 1)) -lt ${#args_ref[@]} ]] || {
+                    echo "Missing value for --repo" >&2
+                    exit 2
+                }
+                REPO_ARG="${args_ref[$((i + 1))]}"
+                unset 'args_ref[i]'
+                unset 'args_ref[i+1]'
+                args_ref=("${args_ref[@]}")
+                ;;
+            --repo=*)
+                REPO_ARG="${args_ref[${i}]#*=}"
+                unset 'args_ref[i]'
+                args_ref=("${args_ref[@]}")
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+    if [[ -z "${REPO_ARG}" ]]; then
+        REPO_ARG="$(resolve_repo_root)"
+    fi
+}
+
+infra_load "${CONFIG_PATH}"
+
+subcmd="${1:-shell}"
+shift || true
+
+case "${subcmd}" in
+    --help|-h|help)
+        usage
+        exit 0
+        ;;
+    env)
+        infra_print
+        exit 0
+        ;;
+    config)
+        case "${1:-}" in
+            show)
+                shift || true
+                args=("$@")
+                extract_repo_arg args
+                infra_print
+                echo "repo_path=${REPO_ARG}"
+                exit 0
+                ;;
+            *)
+                echo "Usage: repoctl config show [--repo <path>]" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    image)
+        case "${1:-}" in
+            build)
+                shift || true
+                args=("$@")
+                extract_repo_arg args
+                exec "${BUILD_REPO_IMAGE}" --repo "${REPO_ARG}" "${args[@]}"
+                ;;
+            *)
+                echo "Usage: repoctl image build [--repo <path>] [--no-cache] [--runtime-image <tag>]" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    verify)
+        case "${1:-}" in
+            spack)
+                shift || true
+                args=("$@")
+                extract_repo_arg args
+                infra_apply_env 0
+                exec "${LAUNCHER}" --repo "${REPO_ARG}" --entrypoint verify-spack.sh
+                ;;
+            uv-layering)
+                shift || true
+                infra_apply_env 0
+                exec "${VERIFY_UV_LAYERING}" "${SYGALDRY_IMAGE}" "$@"
+                ;;
+            image)
+                shift || true
+                args=("$@")
+                extract_repo_arg args
+                skip_spack=0
+                for arg in "${args[@]}"; do
+                    if [[ "${arg}" == "--skip-spack" ]]; then
+                        skip_spack=1
+                    fi
+                done
+
+                infra_apply_env 1
+
+                if [[ -n "${ZEPHYR_INFRA_RUNTIME_IMAGE}" ]] && infra_image_exists "${ZEPHYR_INFRA_RUNTIME_IMAGE}"; then
+                    infra_verify_runtime_label "${ZEPHYR_INFRA_RUNTIME_IMAGE}" "${ZEPHYR_INFRA_BASE_IMAGE_REF}"
+                    echo "[repoctl] Derived image label contract OK: ${ZEPHYR_INFRA_RUNTIME_IMAGE}"
+                elif [[ "${ZEPHYR_INFRA_IMAGE_MODE}" == "derived" ]]; then
+                    echo "[repoctl] ERROR: derived mode requires runtime image '${ZEPHYR_INFRA_RUNTIME_IMAGE}'" >&2
+                    echo "[repoctl] Build it with: repoctl image build --repo ${REPO_ARG}" >&2
+                    exit 1
+                else
+                    echo "[repoctl] Derived image not present; auto/standard mode will use pinned image_ref."
+                fi
+
+                if [[ ${skip_spack} -eq 1 ]]; then
+                    exit 0
+                fi
+
+                infra_apply_env 0
+                exec "${LAUNCHER}" --repo "${REPO_ARG}" --entrypoint verify-spack.sh
+                ;;
+            *)
+                echo "Usage: repoctl verify <spack|uv-layering|image> ..." >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    run)
+        args=("$@")
+        extract_repo_arg args
+        infra_apply_env 0
+        if [[ ${#args[@]} -gt 0 && "${args[0]}" == "--" ]]; then
+            args=("${args[@]:1}")
+        fi
+        [[ ${#args[@]} -gt 0 ]] || {
+            echo "Usage: repoctl run [--repo <path>] -- <command>" >&2
+            exit 2
+        }
+        exec "${LAUNCHER}" --repo "${REPO_ARG}" --entrypoint run-job -- "${args[@]}"
+        ;;
+    shell)
+        args=("$@")
+        extract_repo_arg args
+        infra_apply_env 0
+        exec "${LAUNCHER}" --repo "${REPO_ARG}" "${args[@]}"
+        ;;
+    *)
+        # Backward-compatible passthrough to launcher in repo mode.
+        args=("${subcmd}" "$@")
+        extract_repo_arg args
+        infra_apply_env 0
+        exec "${LAUNCHER}" --repo "${REPO_ARG}" "${args[@]}"
+        ;;
+esac

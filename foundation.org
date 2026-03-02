@@ -1,0 +1,316 @@
+#+TITLE: audri — System Design Foundation
+#+AUTHOR: audri
+#+DATE: 2026-03-05
+#+OPTIONS: toc:2 num:t
+
+* Overview
+
+audri is a streaming text-to-speech pipeline designed for conversational AI
+voice output. It connects an LLM token stream to local audio playback with
+minimal latency, synthesising audio chunk-by-chunk as text arrives rather than
+waiting for the full response.
+
+Target: first audio frame played within ~1–2 seconds of the LLM beginning to
+respond.
+
+* Pipeline Architecture
+
+Three async stages connected by queues, running concurrently within a
+=SpeechSession=:
+
+#+BEGIN_SRC
+LLM token stream
+      │  (string deltas, ~30 ms apart)
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  TextChunker                        [tts/chunker.py]│
+│                                                     │
+│  Accumulates token deltas until a natural boundary: │
+│    - min 48 chars before committing                 │
+│    - strong boundary (.!?;:\n) in a 40-char window  │
+│    - hard max at 180 chars (word-boundary split)    │
+│    - 220 ms silence timeout fallback                │
+│                                                     │
+│  → emits committed text chunks                      │
+└──────────────────────────┬──────────────────────────┘
+                           │  (str chunks, ~50–150 chars)
+                           │  _commit_queue (asyncio.Queue)
+                           ▼
+┌─────────────────────────────────────────────────────┐
+│  Qwen3TTSDriver                      [tts/driver.py]│
+│                                                     │
+│  Loads Qwen3TTSModel once, then for each chunk:     │
+│    - dispatches on tts_model_type:                  │
+│        voice_design  → generate_voice_design()      │
+│        custom_voice  → generate_custom_voice()      │
+│    - runs inference in a thread executor            │
+│    - slices waveform into 480-sample (20 ms) frames │
+│                                                     │
+│  → yields raw PCM bytes frame-by-frame              │
+└──────────────────────────┬──────────────────────────┘
+                           │  (bytes frames, int16 24 kHz mono)
+                           │  _audio_queue (asyncio.Queue)
+                           ▼
+┌─────────────────────────────────────────────────────┐
+│  LocalAudioEgress              [tts/audio_egress.py]│
+│                                                     │
+│  Writes frames to a sounddevice OutputStream.       │
+│  Headless mode: saves WAV files instead.            │
+│  On cancel: drains queue + 2 silence frames (fade). │
+└─────────────────────────────────────────────────────┘
+#+END_SRC
+
+** Session state machine
+
+=SpeechSession= (=tts/session.py=) manages the three tasks and their queues:
+
+#+BEGIN_SRC
+IDLE → BUFFERING → SPEAKING → DONE
+                ↘ CANCELLING → DONE   (barge-in)
+#+END_SRC
+
+Transitions:
+- =start()= → BUFFERING; spawns commit_loop, tts_loop, egress tasks
+- first chunk committed → SPEAKING
+- =push_delta("", is_final=True)= → flushes chunker, sends EOS sentinel
+- =cancel()= → CANCELLING; cancels TTS in-flight via driver.cancel_event
+
+** Public API
+
+=SpeakTool= (=speak_tool.py=) is the top-level interface:
+
+#+BEGIN_SRC python
+tool = SpeakTool(driver=Qwen3TTSDriver())
+await tool.start("session-1", voice="default", language="English")
+async for token in llm_stream:
+    await tool.delta("session-1", token)
+await tool.end("session-1")
+# barge-in at any time:
+await tool.stop("session-1", reason="barge-in")
+#+END_SRC
+
+* Components
+
+** TextChunker
+
+File: =src/audri/tts/chunker.py=
+
+Pure Python, no dependencies. Stateful accumulator with configurable policy:
+
+| Parameter            | Default | Meaning                                    |
+|----------------------+---------+--------------------------------------------|
+| =min_chars_to_start= | 48      | Don't commit until at least this many chars |
+| =max_chars_per_chunk= | 180    | Hard split at word boundary                |
+| =lookahead_chars=    | 40      | Window to search for punctuation after min  |
+| =boundary_timeout_ms= | 220   | Commit on silence (no new token for 220 ms) |
+
+Boundary priority: strong punctuation (.!?;:\n) > space > hard split.
+
+** Qwen3TTSDriver
+
+File: =src/audri/tts/driver.py=
+
+Wraps =qwen_tts.Qwen3TTSModel=. Key parameters:
+
+| Parameter              | Value                               | Notes                                      |
+|------------------------+-------------------------------------+--------------------------------------------|
+| =model_name=           | =Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign= | Default target model                   |
+| =device_map=           | ="cuda:0"=                          | Pin to one GPU; "auto" causes cross-device error |
+| =dtype=                | =torch.bfloat16=                    | See §[[*dtype: bfloat16 on Pascal]]           |
+| =attn_implementation=  | ="sdpa"=                            | flash_attention_2 requires CC ≥ 7.5       |
+
+Model type dispatch (detected at load time from =model.tts_model_type=):
+- =voice_design= → =generate_voice_design(text, language, instruct)=
+- =custom_voice= → =generate_custom_voice(text, language, speaker, instruct)=
+
+Speaker fallback: if the requested speaker is not in =get_supported_speakers()=,
+the driver logs a warning and falls back to =supported[0]=.
+
+PCM output: int16, 24 000 Hz, mono, 480-sample frames (20 ms each).
+
+** LocalAudioEgress
+
+File: =src/audri/tts/audio_egress.py=
+
+Pulls PCM frames from =_audio_queue= and writes to a =sounddevice.OutputStream=.
+=sounddevice= is imported lazily inside =run()= so headless paths don't require
+portaudio at import time.
+
+On =CancelledError= (barge-in): drains the queue, writes 2 silence frames, then
+closes the stream cleanly.
+
+* RTF — Real-Time Factor
+
+** Definition
+
+#+BEGIN_SRC
+RTF = synthesis_time_ms / audio_duration_ms
+#+END_SRC
+
+| RTF       | Meaning                                                    |
+|-----------+------------------------------------------------------------|
+| < 1.0     | Synthesis faster than playback — buffer always has frames  |
+| = 1.0     | Exactly matches playback speed — no headroom               |
+| > 1.0     | Synthesis slower than playback — gaps between chunks       |
+
+For a streaming conversational system, RTF needs to be well below 1.0.
+RTF < 0.5 gives comfortable headroom; RTF < 0.3 is seamless.
+
+** Why RTF matters here
+
+The pipeline synthesises chunks sequentially in =_tts_loop=. With RTF = 2.18:
+
+1. Chunk 0 takes 8.5 s to generate 3.9 s of audio
+2. That 3.9 s plays out while chunk 1 is still synthesising
+3. After playback ends, there is a ~4.6 s gap before chunk 1 is ready
+4. User hears: speech → long silence → speech → long silence → ...
+
+Real-time streaming requires RTF ≪ 1.0 so each chunk is ready before the
+previous one finishes playing.
+
+** Observed results (2026-03-05, 2× GTX 1070 Ti)
+
+| Model                          | synth_ms | audio_s | RTF  |
+|--------------------------------+----------+---------+------|
+| Qwen3-TTS-12Hz-1.7B-VoiceDesign | 8 540   | 3.92    | 2.18 |
+| Qwen3-TTS-12Hz-0.6B-CustomVoice | 10 011  | 4.64    | 2.16 |
+
+Both are hardware-limited; see §[[*Hardware Constraints]].
+
+* Hardware Constraints
+
+** GPUs: 2× NVIDIA GeForce GTX 1070 Ti
+
+| Property           | Value                          |
+|--------------------+--------------------------------|
+| Architecture       | Pascal (GP104, SM 6.1)         |
+| VRAM per GPU       | 8 GB GDDR5                     |
+| Memory bandwidth   | 256 GB/s                       |
+| FP32 throughput    | 8.2 TFLOPS                     |
+| Tensor cores       | None (introduced with Turing)  |
+| Native bfloat16    | None (emulated via fp32 cast)  |
+| Native float16     | Limited (no speedup over fp32) |
+| flash-attn support | No (requires CC ≥ 7.5)         |
+
+** dtype: bfloat16 on Pascal
+
+Pascal has no bfloat16 hardware. When =dtype=torch.bfloat16=:
+
+- Weights are *stored* in bfloat16 (2 bytes/param → 3.4 GB for 1.7B model)
+- All compute is *upcast to fp32* by PyTorch before execution, then downcast back
+- Effective precision: fp32 range (max ~3.4×10³⁸)
+- Effective speed: fp32 throughput (no gain from the smaller type)
+
+*Do not use float16.* Pascal runs real fp16 arithmetic (max 65504). Large logits
+in the code_predictor overflow → =-inf= → softmax produces NaN →
+=torch.multinomial= asserts with =CUDA device-side assert triggered=.
+
+bfloat16 is the correct choice: fp32 numerical stability at half the VRAM cost
+of explicit fp32.
+
+** Multi-GPU limitation
+
+=device_map="auto"= distributes model layers across both GPUs. The =qwen_tts=
+model has a bug where residual connections are not moved to the correct device
+after a layer boundary:
+
+#+BEGIN_SRC
+hidden_states = residual + hidden_states
+RuntimeError: Expected all tensors to be on the same device,
+              but found at least two devices, cuda:0 and cuda:1!
+#+END_SRC
+
+Workaround: =device_map="cuda:0"= pins the entire model to GPU 0. The 1.7B
+model (3.4 GB bfloat16) fits comfortably within the 8 GB budget.
+
+** Path to RTF < 1.0
+
+On this hardware, RTF < 1.0 is not achievable with the current model and stack.
+Options in rough order of impact:
+
+1. *Newer GPU* — A100/H100/RTX 4090 would likely achieve RTF < 0.3 on this model
+2. *Smaller model* — 0.6B-CustomVoice has marginally better RTF (2.16) but same bottleneck
+3. *vLLM-Omni serving* — batched/continuous-batching inference server (Milestone 2 stub)
+4. *flash-attn* — not installable on Pascal (CC < 7.5)
+5. *INT8/INT4 quantisation* — reduces memory bandwidth pressure; not yet explored
+
+* Environment
+
+** Container
+
+- Runtime image: =sygaldry/zephyr:audri-tts=
+- Base: Spack-built torch 2.9.0 + torchaudio 2.9.0, Python 3.13.8, CUDA 12.9.1
+- System libs baked in: =libsndfile1=, =libportaudio2=, =sox=
+- Repo mounted at =/workspace/audri= inside container
+
+** qwen3-tts venv
+
+Managed by UV on top of the Spack base at =.venv-mlsys/qwen3-tts/=:
+
+| Package         | Version  | Notes                                      |
+|-----------------+----------+--------------------------------------------|
+| transformers    | 4.57.3   | Pinned — qwen-tts incompatible with newer  |
+| accelerate      | 1.12.0   | --no-deps (avoids triton resolution clash) |
+| qwen-tts        | 0.1.1    | --no-deps                                  |
+| librosa, soxr   | latest   |                                            |
+| sounddevice     | latest   |                                            |
+| onnxruntime     | 1.24.2   |                                            |
+| einops          | 0.8.2    |                                            |
+| soundfile, sox  | latest   |                                            |
+
+** Activation (critical)
+
+The container pre-activates =/opt/mlsys-envs/hf-transformers= which sets
+=PYTHONPATH=, shadowing the qwen3-tts venv. Always:
+
+#+BEGIN_SRC bash
+unset PYTHONPATH && source /workspace/audri/.venv-mlsys/qwen3-tts/bin/activate
+#+END_SRC
+
+* Milestone Status
+
+| Milestone | Description                        | Status       | Date       |
+|-----------+------------------------------------+--------------+------------|
+| M0        | Smoke test: load + WAV synthesis   | PASSED ✓     | 2026-03-04 |
+| M1        | Streaming demo: tokens → WAV files | PASSED ✓     | 2026-03-04 |
+| M2        | VLLMOmniTTSDriver (HTTP client)    | Not planned  |            |
+| M3        | Agent/API integration              | Not started  |            |
+
+** M0 result
+
+#+BEGIN_SRC
+model_load_ms    = 4 815  (cached) / 30 189 (cold)
+synth_ms         = 8 540
+audio_duration_s = 3.920
+RTF              = 2.18  (hardware-limited)
+output           = outputs/smoke_test.wav
+#+END_SRC
+
+** M1 result
+
+#+BEGIN_SRC
+input:       256-char text, streamed as 64 tokens at 30 ms/token
+stream_ms:   1 952
+tts_tail_ms: 50 716
+chunks:      7
+output:      outputs/speak_demo_00.wav … speak_demo_06.wav
+#+END_SRC
+
+* Run Commands
+
+#+BEGIN_SRC bash
+# Milestone 0 — smoke test
+.sygaldry/zephyr/bin/repoctl run -- bash -c "
+  unset PYTHONPATH &&
+  source /workspace/audri/.venv-mlsys/qwen3-tts/bin/activate &&
+  python3 /workspace/audri/scripts/smoke_test_tts.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+"
+
+# Milestone 1 — streaming demo (headless)
+.sygaldry/zephyr/bin/repoctl run -- bash -c "
+  unset PYTHONPATH &&
+  source /workspace/audri/.venv-mlsys/qwen3-tts/bin/activate &&
+  AUDRI_HEADLESS=1 python3 /workspace/audri/scripts/speak_demo.py
+"
+#+END_SRC

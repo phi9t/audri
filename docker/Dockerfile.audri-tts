@@ -1,0 +1,17 @@
+# audri-tts runtime image
+# Derived from zephyr:hf-20260226 (torch + torchaudio via Spack, transformers/accelerate via uv)
+# Adds system libraries required by the qwen3-tts Python stack:
+#   libsndfile1  — needed by soundfile (used by librosa and qwen_tts)
+#   sox          — system binary wrapped by the sox Python package (used by qwen_tts speech codec)
+
+FROM sygaldry/zephyr:hf-20260226
+
+USER root
+
+RUN apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libsndfile1 \
+        sox \
+    && rm -rf /var/lib/apt/lists/*
+
+USER kvothe

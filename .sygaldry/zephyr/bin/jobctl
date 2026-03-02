@@ -1,0 +1,68 @@
+#!/bin/bash
+set -eu -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+KIT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly KIT_ROOT
+
+readonly CONFIG_PATH="${ZEPHYR_INFRA_CONFIG:-${KIT_ROOT}/infra.yaml}"
+readonly JOB_RUNNER="${KIT_ROOT}/lib/zephyr_job.sh"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  jobctl run --job <name> -- <command>
+  jobctl status --job <name>
+  jobctl tail --job <name> [--lines N]
+  jobctl stop --job <name>
+  jobctl health --job <name>
+
+Defaults:
+- --project-id is auto-filled from infra.yaml
+- --lease-mode is auto-filled for `run` from infra.yaml
+USAGE
+}
+
+subcmd="${1:-}"
+if [[ -z "${subcmd}" ]]; then
+    usage
+    exit 2
+fi
+shift || true
+
+if [[ "${subcmd}" == "--help" || "${subcmd}" == "-h" || "${subcmd}" == "help" ]]; then
+    usage
+    exit 0
+fi
+
+# shellcheck disable=SC1091
+source "${KIT_ROOT}/lib/infra_config.sh"
+infra_load "${CONFIG_PATH}"
+infra_apply_env 0
+
+args=("${subcmd}" "$@")
+has_project_id=0
+has_lease_mode=0
+
+for ((i=1; i<${#args[@]}; i++)); do
+    case "${args[$i]}" in
+        --project-id|--project-id=*)
+            has_project_id=1
+            ;;
+        --lease-mode|--lease-mode=*)
+            has_lease_mode=1
+            ;;
+    esac
+done
+
+if [[ "${subcmd}" == "run" || "${subcmd}" == "status" || "${subcmd}" == "tail" || "${subcmd}" == "stop" || "${subcmd}" == "health" ]]; then
+    if [[ ${has_project_id} -eq 0 ]]; then
+        args=("${subcmd}" --project-id "${SYGALDRY_PROJECT_ID}" "${args[@]:1}")
+    fi
+    if [[ "${subcmd}" == "run" && ${has_lease_mode} -eq 0 ]]; then
+        args=("${args[0]}" --lease-mode "${ZEPHYR_LEASE_MODE}" "${args[@]:1}")
+    fi
+fi
+
+exec "${JOB_RUNNER}" "${args[@]}"

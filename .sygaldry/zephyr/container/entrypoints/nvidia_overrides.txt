@@ -1,0 +1,52 @@
+# UV override file: prevent installation of NVIDIA/CUDA pip packages.
+#
+# These packages are provided by the Docker base image (nvidia/cuda)
+# and the Spack environment.  The impossible-marker pattern
+# (sys_platform == 'never') causes UV to skip them when encountered
+# as transitive dependencies of packages like vllm, sglang, etc.
+#
+# See: https://docs.astral.sh/uv/concepts/resolution/#overrides
+
+# --- CUDA 12 variants ---
+nvidia-cublas-cu12; sys_platform == 'never'
+nvidia-cuda-cupti-cu12; sys_platform == 'never'
+nvidia-cuda-nvrtc-cu12; sys_platform == 'never'
+nvidia-cuda-runtime-cu12; sys_platform == 'never'
+nvidia-cudnn-cu12; sys_platform == 'never'
+nvidia-cufft-cu12; sys_platform == 'never'
+nvidia-curand-cu12; sys_platform == 'never'
+nvidia-cusolver-cu12; sys_platform == 'never'
+nvidia-cusparse-cu12; sys_platform == 'never'
+nvidia-nccl-cu12; sys_platform == 'never'
+nvidia-nvjitlink-cu12; sys_platform == 'never'
+nvidia-nvtx-cu12; sys_platform == 'never'
+
+# --- CUDA 11 variants ---
+nvidia-cublas-cu11; sys_platform == 'never'
+nvidia-cuda-cupti-cu11; sys_platform == 'never'
+nvidia-cuda-nvrtc-cu11; sys_platform == 'never'
+nvidia-cuda-runtime-cu11; sys_platform == 'never'
+nvidia-cudnn-cu11; sys_platform == 'never'
+nvidia-cufft-cu11; sys_platform == 'never'
+nvidia-curand-cu11; sys_platform == 'never'
+nvidia-cusolver-cu11; sys_platform == 'never'
+nvidia-cusparse-cu11; sys_platform == 'never'
+nvidia-nccl-cu11; sys_platform == 'never'
+nvidia-nvjitlink-cu11; sys_platform == 'never'
+nvidia-nvtx-cu11; sys_platform == 'never'
+
+# --- Misc NVIDIA pip meta-packages ---
+nvidia-cuda-nvcc-cu12; sys_platform == 'never'
+nvidia-cuda-nvcc-cu11; sys_platform == 'never'
+nvidia-pyindex; sys_platform == 'never'
+nvidia-ml-py; sys_platform == 'never'
+
+# --- Broken Spack dist-info workarounds ---
+# python-dateutil is v2.8.2 in the Spack view but its dist-info
+# reports 0.0.0, causing UV resolution failures for transitive deps.
+python-dateutil>=2.8.2
+
+# --- Spack-owned package relaxations ---
+# Packages that some pip packages pin too tightly but Spack provides correctly.
+# megatron-core pins numpy<2.0.0, Spack has 2.3.4 — runtime is fine.
+numpy>=2.0.0

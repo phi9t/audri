@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "audri"
+version = "0.1.0"
+description = "Streaming text-to-speech pipeline for conversational AI"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+
+# Core library deps only. TTS inference additionally requires the qwen3-tts
+# environment (transformers==4.57.3, qwen-tts==0.1.1, etc.) provided by the
+# mlsys env yaml at .codex-zephyr-mlsys/envs/qwen3-tts.yaml.
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+# Install TTS inference stack outside the hermetic container environment.
+# Inside the container, use `just build-env` instead.
+tts = [
+    "torch>=2.0",
+    "transformers==4.57.3",
+    "accelerate",
+    "qwen-tts==0.1.1",
+    "librosa",
+    "soxr",
+    "soundfile",
+    "onnxruntime",
+    "einops",
+    "sox",
+]
+
+[project.urls]
+Repository = "https://github.com/audri-ai/audri"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/audri"]
