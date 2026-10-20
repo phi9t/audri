@@ -1,0 +1,23 @@
+# The client/API is independent of the existing Zephyr GPU runtime. All
+# installation happens in this isolated container; no Spack-owned packages.
+FROM ghcr.io/astral-sh/uv:0.13.4-python3.13-bookworm-slim AS base
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN uv sync --no-dev --extra fish --extra server
+ENV PATH="/app/.venv/bin:$PATH"
+
+FROM base AS test
+COPY tests ./tests
+COPY examples ./examples
+RUN uv sync --extra fish --extra server
+RUN python -m unittest discover -s tests -v
+RUN ruff check src tests examples
+
+FROM base AS runtime
+RUN useradd --uid 10001 --create-home audri
+USER audri
+EXPOSE 8765
+ENTRYPOINT ["audri"]
+CMD ["serve", "--backend", "fish", "--host", "0.0.0.0", "--port", "8765"]

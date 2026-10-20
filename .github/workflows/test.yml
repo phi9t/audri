@@ -1,0 +1,30 @@
+name: audio-framework
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: audri-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  container-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify repository environment policy
+        run: bash scripts/zephyr_policy_check.sh
+      - name: Test the CPU client and API inside an isolated container
+        run: docker build --progress plain --target test -t audri-tests -f docker/Dockerfile.client .
+      - name: Verify installed command and produce a diagnostic WAV
+        run: |
+          mkdir -p outputs
+          docker run --rm -v "$PWD/outputs:/artifacts" audri-tests python -m audri --help
+          docker run --rm -v "$PWD/outputs:/artifacts" audri-tests python -m audri speak 'Framework diagnostic, not speech.' --backend tone --output /artifacts/diagnostic.wav
+          docker run --rm audri-tests cat uv.lock > outputs/uv.lock
+      - name: Retain diagnostic audio and resolved client environment
+        uses: actions/upload-artifact@v4
+        with:
+          name: audri-client-verification
+          path: outputs/

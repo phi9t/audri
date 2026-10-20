@@ -1,0 +1,9 @@
+.git
+.venv*
+__pycache__
+*.pyc
+outputs
+runs
+dist
+.sygaldry
+.codex-zephyr-mlsys
