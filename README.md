@@ -275,6 +275,12 @@ fixture through Fish decoding, session orchestration, and finalized WAV output;
 API/WebSocket interruption tests; and local-worker ownership tests. Model
 weights are not needed for those tests.
 
+The client image uses the committed `uv.lock` with `uv sync --locked`. CI also
+starts the packaged HTTP service and retains its diagnostic WAV files and
+resolved environment. The lock covers all declared extras, while the client
+image installs only the Fish client and API dependencies. The separate Zephyr
+model environment keeps its existing Spack and layering constraints.
+
 Real Fish/Qwen acoustic quality, GPU latency, VRAM, and sustained concurrency
 require a live model deployment and listening evaluation. Native Fish does not
 offer an explicit per-request GPU abort API; closing the client transport stops
