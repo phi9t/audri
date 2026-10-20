@@ -345,9 +345,10 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         driver = GatedDriver()
         async with SpeakTool(driver, CHUNKER, NullAudioEgress) as tool:
             original = await tool.start("same")
-            await tool.delta("same", "First.")
+            await tool.delta("same", "First.", is_final=True)
             ending = asyncio.create_task(tool.end("same"))
             await driver.started.wait()
+            await asyncio.sleep(0)  # Let end() bind to the original generation.
             replacement = await tool.start("same")
             await ending
             self.assertIs(tool.sessions["same"], replacement)

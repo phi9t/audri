@@ -264,6 +264,25 @@ class DisconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.cleaned, 1)
         self.assertTrue(any(item["type"] == "http.response.start" and item["status"] == 499 for item in received))
 
+    async def test_stalled_http_sender_times_out_and_releases_slot(self):
+        import httpx
+
+        driver = SlowDriver()
+        app = create_app(driver, max_sessions=1, limits=ServerLimits(send_timeout_s=0.02))
+        incoming = asyncio.Queue()
+        await incoming.put({"type": "http.request", "body": b'{"input":"hello","response_format":"pcm"}', "more_body": False})
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                await asyncio.Event().wait()
+
+        with self.assertRaises((TimeoutError, BaseExceptionGroup)):
+            await asyncio.wait_for(app(self.scope(), incoming.get, send), 2)
+        self.assertEqual(driver.cleaned, 1)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/health")
+            self.assertEqual(response.json()["active_sessions"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

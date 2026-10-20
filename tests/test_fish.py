@@ -258,6 +258,19 @@ class FishDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(driver._streams)
         await driver.aclose()
 
+    async def test_stream_can_be_advanced_and_closed_by_different_tasks(self):
+        client = FakeClient(lambda: FakeResponse([streaming_wav(b"\0\0" * 44100)]))
+        driver = FishSpeechDriver(client=client)
+        stream = driver.stream(SynthesisRequest("hello"))
+        first = await asyncio.create_task(anext(stream))
+        self.assertGreater(first.samples, 0)
+        second = await asyncio.create_task(anext(stream))
+        self.assertGreater(second.samples, 0)
+        await asyncio.create_task(stream.aclose())
+        self.assertEqual(client.active, 0)
+        self.assertFalse(driver._streams)
+        await driver.aclose()
+
     async def test_configuration_and_ambiguous_voice_rejected(self):
         for kwargs in ({"base_url": "file:///tmp/x"}, {"base_url": "http://user:pass@host"},
                        {"timeout": 0}, {"timeout": float("nan")}, {"max_concurrency": 0}):

@@ -1,13 +1,15 @@
 import contextlib
+import asyncio
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 import wave
 
-from audri.cli import main
+from audri.cli import _stdin_deltas, main
 
 
 class CLITests(unittest.TestCase):
@@ -89,6 +91,47 @@ class CLITests(unittest.TestCase):
                                            "--output", str(Path(directory) / "a.wav")])
             self.assertEqual(code, 1)
             self.assertIn("--reference-text", errors)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX input readiness")
+class InputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pipe_yields_before_newline_and_handles_split_utf8(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "r", encoding="utf-8") as stream:
+            iterator = _stdin_deltas(stream)
+            pending = asyncio.create_task(anext(iterator))
+            try:
+                encoded = "你".encode("utf-8")
+                os.write(write_fd, encoded[:2])
+                await asyncio.sleep(0.01)
+                self.assertFalse(pending.done())
+                os.write(write_fd, encoded[2:])
+                self.assertEqual(await asyncio.wait_for(pending, 1), "你")
+                os.close(write_fd)
+                write_fd = -1
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(iterator)
+            finally:
+                if write_fd >= 0:
+                    os.close(write_fd)
+                if not pending.done():
+                    pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+                await iterator.aclose()
+
+    async def test_cancellation_does_not_wait_for_pipe_writer(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "r", encoding="utf-8") as stream:
+            iterator = _stdin_deltas(stream)
+            pending = asyncio.create_task(anext(iterator))
+            try:
+                await asyncio.sleep(0)
+                pending.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(pending, 0.2)
+                await iterator.aclose()
+            finally:
+                os.close(write_fd)
 
 
 if __name__ == "__main__":

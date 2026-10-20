@@ -197,6 +197,8 @@ class Qwen3TTSDriver(TTSDriver):
             elif model_type == "base":
                 if len(request.references) != 1:
                     raise ValueError("Qwen Base requires exactly one inline VoiceReference")
+                if request.voice != "default" or request.references[0].speaker is not None:
+                    raise ValueError("Qwen Base takes one reference without a voice ID or speaker index")
                 if instruction:
                     raise ValueError("Qwen Base does not support style instructions")
                 import soundfile as sf

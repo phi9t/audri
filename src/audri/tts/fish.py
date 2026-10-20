@@ -12,7 +12,7 @@ import math
 import re
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from audri.audio import AudioFrame, PCMFramer
 from audri.tts.driver import DriverCapabilities, TTSDriver
@@ -84,7 +84,14 @@ class FishSpeechDriver(TTSDriver):
             or parsed.fragment
         ):
             raise ValueError("base_url must be an HTTP(S) service URL without credentials or query")
-        if not math.isfinite(timeout) or timeout <= 0:
+        # Accessing port also validates malformed/non-numeric port strings.
+        _ = parsed.port
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("timeout must be a finite positive number")
         if (
             isinstance(max_concurrency, bool)
@@ -92,7 +99,7 @@ class FishSpeechDriver(TTSDriver):
             or max_concurrency < 1
         ):
             raise ValueError("max_concurrency must be a positive integer")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
         self.timeout = timeout
         self._headers = {"Accept": "audio/wav"}
         if api_key:

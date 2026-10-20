@@ -63,7 +63,8 @@ class SessionConfig:
                 raise ValueError(f"{name} must be a positive integer")
         for name in ("max_audio_seconds", "synthesis_timeout_s"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{name} must be finite and positive")
 
 
@@ -147,6 +148,7 @@ class SpeechSession:
         self._error: BaseException | None = None
         self._finalized = False
         self._cancel_requested = False
+        self._stage_failed = False
         self._started_at = 0.0
         self._produced_seconds = 0.0
         self._format: AudioFormat | None = None
@@ -234,7 +236,13 @@ class SpeechSession:
         if self._runner is None:
             raise RuntimeError("start the speech session before waiting")
         if not self._finished.is_set():
-            await asyncio.shield(self._runner)
+            try:
+                await asyncio.shield(self._runner)
+            except asyncio.CancelledError:
+                if self._runner.cancelled():
+                    await self._complete_early_cancel()
+                else:
+                    raise
         if self._error is not None:
             raise self._error
         return self.metrics
@@ -322,9 +330,13 @@ class SpeechSession:
             # TaskGroup treats a child CancelledError as a normal exit. A
             # backend that independently cancels itself must not leave its
             # siblings waiting forever for EOF that will never arrive.
-            if (not self._cancel_requested and self._runner is not None
+            if (not self._cancel_requested and not self._stage_failed and self._runner is not None
                     and not self._runner.cancelling()):
+                self._stage_failed = True
                 raise RuntimeError("a speech pipeline stage cancelled unexpectedly") from None
+            raise
+        except Exception:
+            self._stage_failed = True
             raise
 
     async def _commit(self, chunk: str) -> None:

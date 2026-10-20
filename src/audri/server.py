@@ -198,7 +198,9 @@ async def _audio_frames(driver, synthesis, token, limits):
             raise RuntimeError("backend returned no audio")
     finally:
         token.cancel()
-        await iterator.aclose()
+        with anyio.CancelScope(shield=True):
+            async with asyncio.timeout(5):
+                await iterator.aclose()
 
 
 async def _until_disconnect(request, operation, token):
@@ -347,7 +349,8 @@ def create_app(driver, *, api_key: str | None = None, max_sessions: int = 8, lim
 
             return _OwnedStreamingResponse(wav_body(), cleanup=cleanup, send_timeout_s=limits.send_timeout_s, media_type="audio/wav", headers=format_headers)
         except BaseException as exc:
-            await cleanup()
+            with anyio.CancelScope(shield=True):
+                await cleanup()
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if isinstance(exc, Exception):
@@ -511,10 +514,11 @@ def create_app(driver, *, api_key: str | None = None, max_sessions: int = 8, lim
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
-            try:
-                await stop_current()
-                await tool.aclose()
-            finally:
-                await admission.leave()
+            with anyio.CancelScope(shield=True):
+                try:
+                    await stop_current()
+                    await tool.aclose()
+                finally:
+                    await admission.leave()
 
     return app

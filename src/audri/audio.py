@@ -74,7 +74,7 @@ class PCMFramer:
     """
 
     def __init__(self, format: AudioFormat, frame_ms: float = 20) -> None:
-        if not math.isfinite(frame_ms) or not 1 <= frame_ms <= 1000:
+        if isinstance(frame_ms, bool) or not isinstance(frame_ms, (int, float)) or not math.isfinite(frame_ms) or not 1 <= frame_ms <= 1000:
             raise ValueError("frame_ms must be finite and between 1 and 1000")
         self.format = format
         self.frame_samples = max(1, round(format.sample_rate * frame_ms / 1000))
