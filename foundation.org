@@ -3,6 +3,14 @@
 #+DATE: 2026-03-05
 #+OPTIONS: toc:2 num:t
 
+* Historical design record
+
+This is the March 2026 prototype design and its historical measurements.
+For the current framework, supported backends, and verified behavior, see
+=README.md=, =docs/architecture.md=, and =docs/fish-speech.md=. In particular,
+audio formats now travel with frames, queues are bounded, model imports are
+lazy, and cancellation belongs to each session.
+
 * Overview
 
 audri is a streaming text-to-speech pipeline designed for conversational AI

@@ -12,8 +12,9 @@ ENV PATH="/app/.venv/bin:$PATH"
 FROM base AS test
 COPY tests ./tests
 COPY examples ./examples
+COPY scripts/test_framework.py ./scripts/test_framework.py
 RUN uv sync --extra fish --extra server
-RUN python -m unittest discover -s tests -v
+RUN timeout 180 python scripts/test_framework.py
 RUN ruff check src tests examples
 
 FROM base AS runtime

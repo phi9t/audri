@@ -18,6 +18,10 @@ dist/
 # Local outputs (generated at runtime)
 outputs/
 runs/
+checkpoints/
+.ruff_cache/
+.pytest_cache/
+.coverage
 
 # Local session / scratch files
 session-*.md
