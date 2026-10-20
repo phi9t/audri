@@ -1,0 +1,51 @@
+name: audio-framework
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: audri-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  container-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install the repository policy scanner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+      - name: Verify repository environment policy
+        run: bash scripts/zephyr_policy_check.sh
+      - name: Test the CPU client and API inside an isolated container
+        run: docker build --progress plain --build-arg AUDRI_PYTHON=${{ matrix.python }} --target test -t audri-tests -f docker/Dockerfile.client .
+      - name: Verify installed command and produce a diagnostic WAV
+        run: |
+          docker build --build-arg AUDRI_PYTHON=${{ matrix.python }} --target runtime -t audri-client -f docker/Dockerfile.client .
+          mkdir -p outputs
+          docker run --rm audri-client --help
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/outputs:/artifacts" audri-client speak 'Framework diagnostic, not speech.' --backend tone --output /artifacts/diagnostic.wav
+          docker run --rm audri-tests cat uv.lock > outputs/uv.lock
+      - name: Exercise the packaged HTTP service over a real socket
+        run: |
+          docker run --detach --name audri-api --publish 127.0.0.1:8765:8765 audri-client serve --backend tone --host 0.0.0.0 --port 8765
+          cleanup() {
+            docker logs audri-api
+            docker rm --force audri-api >/dev/null
+          }
+          trap cleanup EXIT
+          curl --fail --silent --show-error --max-time 2 --retry 15 --retry-all-errors --retry-delay 1 http://127.0.0.1:8765/health
+          curl --fail --silent --show-error http://127.0.0.1:8765/v1/audio/speech -H 'Content-Type: application/json' -d '{"input":"Container API diagnostic.","response_format":"wav"}' --output outputs/api-diagnostic.wav
+          docker run --rm -v "$PWD/outputs:/artifacts:ro" --entrypoint python audri-client -c 'import wave; w = wave.open("/artifacts/api-diagnostic.wav"); assert w.getnframes() > 0 and w.getsampwidth() == 2; print("Packaged HTTP service returned valid PCM16 WAV")'
+      - name: Retain diagnostic audio and resolved client environment
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: audri-client-verification-${{ matrix.python }}
+          path: outputs/

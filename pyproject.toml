@@ -4,23 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audri"
-version = "0.1.0"
-description = "Streaming text-to-speech pipeline for conversational AI"
+version = "0.2.0"
+description = "Bounded streaming speech framework with Fish Speech and Qwen backends"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 
-# Core library deps only. TTS inference additionally requires the qwen3-tts
-# environment (transformers==4.57.3, qwen-tts==0.1.1, etc.) provided by the
-# mlsys env yaml at .codex-zephyr-mlsys/envs/qwen3-tts.yaml.
-dependencies = [
-    "numpy",
-]
+# The audio/session/chunking core and diagnostic backend use only the stdlib.
+dependencies = []
+
+[project.scripts]
+audri = "audri.cli:main"
 
 [project.optional-dependencies]
-# Install TTS inference stack outside the hermetic container environment.
-# Inside the container, use `just build-env` instead.
+fish = ["httpx>=0.28.1,<0.29"]
+server = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1"]
+playback = ["sounddevice>=0.5,<0.6"]
+# For a separate model container, not the CPU client or the Spack environment.
+# The existing Zephyr container uses `just build-env` instead of this extra.
 tts = [
+    "numpy>=2.0",
     "torch>=2.0",
     "transformers==4.57.3",
     "accelerate",
@@ -34,7 +37,18 @@ tts = [
 ]
 
 [project.urls]
-Repository = "https://github.com/audri-ai/audri"
+Repository = "https://github.com/phi9t/audri"
+
+[dependency-groups]
+dev = ["ruff>=0.14,<1"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [".sygaldry", ".codex-zephyr-mlsys"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/audri"]

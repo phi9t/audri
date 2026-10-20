@@ -1,0 +1,25 @@
+# The client/API is independent of the existing Zephyr GPU runtime. All
+# installation happens in this isolated container; no Spack-owned packages.
+ARG AUDRI_PYTHON=3.13
+FROM ghcr.io/astral-sh/uv:0.13.4-python${AUDRI_PYTHON}-trixie-slim AS base
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY src ./src
+RUN uv sync --locked --no-dev --extra fish --extra server
+ENV PATH="/app/.venv/bin:$PATH"
+
+FROM base AS test
+COPY tests ./tests
+COPY examples ./examples
+COPY scripts/test_framework.py ./scripts/test_framework.py
+RUN uv sync --locked --extra fish --extra server
+RUN ruff check src tests examples
+RUN timeout 180 python scripts/test_framework.py
+
+FROM base AS runtime
+RUN useradd --uid 10001 --create-home audri
+USER audri
+EXPOSE 8765
+ENTRYPOINT ["audri"]
+CMD ["serve", "--backend", "fish", "--host", "0.0.0.0", "--port", "8765"]

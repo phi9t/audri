@@ -73,3 +73,17 @@ demo model=tts_model:
 # usage: just run "python3 -c 'import transformers; print(transformers.__version__)'"
 run cmd:
   "{{repoctl}}" run -- bash -c "{{activate}} && {{cmd}}"
+
+# Test the dependency-light client and API in their own CPU container.
+# The existing Zephyr configuration continues to own local Qwen inference.
+test:
+  docker build --progress plain --target test -t audri-tests -f docker/Dockerfile.client .
+
+# Build the Fish client/API image (no model weights or GPU packages).
+client-image:
+  docker build --target runtime -t audri-client -f docker/Dockerfile.client .
+
+# Exercise real framing and WAV output using a diagnostic signal, not speech.
+diagnostic: client-image
+  mkdir -p outputs
+  docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/outputs:/outputs" audri-client speak 'Audri diagnostic.' --backend tone --output /outputs/diagnostic.wav --overwrite

@@ -1,147 +1,162 @@
-"""Text Committer / Chunker — pure Python, no deps.
-
-Splits a streaming token delta sequence into committed chunks suitable for
-TTS synthesis. Boundaries are chosen at sentence/clause punctuation; a
-timeout fallback fires when no boundary arrives within `boundary_timeout_ms`.
-"""
+"""Bounded, multilingual text commits for an incremental token stream."""
 
 from __future__ import annotations
 
+import math
+import re
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+
+_BOUNDARIES = frozenset(".!?;:\n。！？；：")
+_ABBREVIATIONS = frozenset({"mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc", "e.g", "i.e"})
 
 
-# Punctuation characters treated as strong boundaries (prefer over spaces)
-_STRONG_BOUNDARY = frozenset(".!?;:\n")
-
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ChunkerConfig:
     min_chars_to_start: int = 48
-    """Don't commit until at least this many chars have accumulated."""
     max_chars_per_chunk: int = 180
-    """Force a word-boundary commit when pending text exceeds this."""
     lookahead_chars: int = 40
-    """Scan this many chars ahead of min_chars_to_start to find a boundary."""
     boundary_timeout_ms: float = 220
-    """Fire a word-boundary commit if no delta arrives within this window."""
+
+    def __post_init__(self) -> None:
+        for name in ("min_chars_to_start", "max_chars_per_chunk", "lookahead_chars"):
+            value = getattr(self, name)
+            if type(value) is not int or value < (0 if name == "lookahead_chars" else 1):
+                raise ValueError(f"{name} must be a valid nonnegative integer")
+        if self.min_chars_to_start > self.max_chars_per_chunk:
+            raise ValueError("min_chars_to_start cannot exceed max_chars_per_chunk")
+        if not math.isfinite(self.boundary_timeout_ms) or self.boundary_timeout_ms <= 0:
+            raise ValueError("boundary_timeout_ms must be finite and positive")
 
 
 class TextChunker:
-    """Accumulates streaming text deltas and commits chunks at natural boundaries.
+    """Keep every emitted chunk within the hard size bound, including final flush.
 
-    Usage::
+    Sentence punctuation in Latin and CJK text is preferred. Decimal points and
+    common abbreviations are not sentence boundaries. Bracketed Fish controls
+    and <|...|> tokens are kept whole; an overlong control is rejected instead
+    of being split into corrupted model input. This is a text boundary policy,
+    not a Markdown renderer or a full linguistic sentence tokenizer.
 
-        chunker = TextChunker()
-        for delta in stream:
-            chunk = chunker.push(delta)
-            if chunk:
-                tts_queue.put(chunk)
-        final = chunker.flush()
-        if final:
-            tts_queue.put(final)
+    A single large delta can create multiple ready chunks. Call pop_ready until
+    it returns None. On EOF, call flush until it returns None.
     """
 
-    def __init__(self, config: Optional[ChunkerConfig] = None) -> None:
+    def __init__(self, config: ChunkerConfig | None = None) -> None:
         self.config = config or ChunkerConfig()
-        self.pending_text: str = ""
-        self.last_delta_ts: float = time.monotonic()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def push(self, delta: str) -> Optional[str]:
-        """Append *delta* and return a committed chunk if a boundary is found."""
-        self.pending_text += delta
-        self.last_delta_ts = time.monotonic()
-        return self._try_commit()
-
-    def flush(self) -> Optional[str]:
-        """Force-commit all remaining text (call on speak_end / EOS)."""
-        text = self.pending_text.strip()
         self.pending_text = ""
-        return text if text else None
+        self.last_delta_ts = time.monotonic()
 
-    def check_timeout(self) -> Optional[str]:
-        """Call periodically; returns a committed chunk if the timeout fired."""
-        if self.timeout_fired and self.pending_text.strip():
-            return self._commit_word_boundary(len(self.pending_text))
+    def push(self, delta: str) -> str | None:
+        if not isinstance(delta, str):
+            raise TypeError("text delta must be a string")
+        self.pending_text += delta
+        if delta:
+            self.last_delta_ts = time.monotonic()
+        return self.pop_ready()
+
+    def pop_ready(self) -> str | None:
+        self.pending_text = self.pending_text.lstrip()
+        text = self.pending_text
+        n = len(text)
+        cfg = self.config
+        if not n:
+            return None
+        limit = min(n, cfg.max_chars_per_chunk)
+        safe_limit = self._safe_end(limit)
+        if n >= cfg.min_chars_to_start:
+            search_end = min(safe_limit, cfg.min_chars_to_start + cfg.lookahead_chars)
+            for end in range(search_end, cfg.min_chars_to_start - 1, -1):
+                if self._boundary(end) and self._safe_end(end) == end:
+                    return self._commit(end)
+        if n >= cfg.max_chars_per_chunk:
+            if safe_limit == 0:
+                # A control of exactly max length may still be awaiting its
+                # closing delimiter. A larger one can never meet the bound.
+                if n > cfg.max_chars_per_chunk:
+                    raise ValueError("a control token exceeds max_chars_per_chunk")
+                return None
+            return self._commit(self._word_end(safe_limit))
         return None
+
+    def flush(self) -> str | None:
+        self.pending_text = self.pending_text.lstrip()
+        if not self.pending_text:
+            return None
+        limit = min(len(self.pending_text), self.config.max_chars_per_chunk)
+        safe = self._safe_end(limit, final=True)
+        if safe == 0:
+            raise ValueError("a control token exceeds max_chars_per_chunk")
+        if len(self.pending_text) <= self.config.max_chars_per_chunk:
+            return self._commit(safe)
+        return self._commit(self._word_end(safe))
+
+    def check_timeout(self) -> str | None:
+        if not self.timeout_fired:
+            return None
+        self.pending_text = self.pending_text.lstrip()
+        if not self.pending_text:
+            return None
+        limit = self._safe_end(min(len(self.pending_text), self.config.max_chars_per_chunk))
+        if not limit:
+            return None
+        return self._commit(self._word_end(limit))
 
     @property
     def timeout_fired(self) -> bool:
-        elapsed = time.monotonic() - self.last_delta_ts
-        return elapsed > self.config.boundary_timeout_ms / 1000.0
+        return time.monotonic() - self.last_delta_ts >= self.config.boundary_timeout_ms / 1000
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _try_commit(self) -> Optional[str]:
-        n = len(self.pending_text)
-        cfg = self.config
-
-        # Not enough text yet — but check hard max first
-        if n >= cfg.max_chars_per_chunk:
-            return self._commit_word_boundary(n)
-
-        if n < cfg.min_chars_to_start:
-            return None
-
-        # Enough text — search for a boundary in the lookahead window
-        search_end = min(n, cfg.min_chars_to_start + cfg.lookahead_chars)
-        pos = self._best_boundary_before(search_end)
-        if pos is not None:
-            return self._commit_at(pos + 1)  # include the boundary char
-
-        return None
-
-    def _choose_commit(self) -> Optional[int]:
-        """Return commit position (exclusive) or None. Pure logic, no side-effects."""
-        n = len(self.pending_text)
-        cfg = self.config
-
-        if n >= cfg.max_chars_per_chunk:
-            pos = self._best_word_boundary_before(n)
-            return pos if pos is not None else n
-
-        if n < cfg.min_chars_to_start:
-            return None
-
-        search_end = min(n, cfg.min_chars_to_start + cfg.lookahead_chars)
-        pos = self._best_boundary_before(search_end)
-        if pos is not None:
-            return pos + 1
-
-        return None
-
-    def _best_boundary_before(self, end: int) -> Optional[int]:
-        """Scan left from *end* for a strong punctuation boundary."""
+    def _boundary(self, end: int) -> bool:
         text = self.pending_text
-        for i in range(end - 1, -1, -1):
-            if text[i] in _STRONG_BOUNDARY:
-                return i
-        # Fall back to a space if no punctuation found
-        return self._best_word_boundary_before(end)
+        char = text[end - 1]
+        if char not in _BOUNDARIES:
+            return False
+        if char in ".:":
+            before = text[end - 2] if end > 1 else ""
+            after = text[end] if end < len(text) else ""
+            if before.isdigit() and (after.isdigit() or not after):
+                return False
+        if char == ".":
+            word = re.search(r"([A-Za-z.]+)\.$", text[:end])
+            if word and (word[1].lower() in _ABBREVIATIONS or len(word[1]) == 1):
+                return False
+        return True
 
-    def _best_word_boundary_before(self, end: int) -> Optional[int]:
-        """Scan left from *end* for a space (word boundary)."""
+    def _safe_end(self, limit: int, final: bool = False) -> int:
+        """Return an endpoint that does not bisect a model control span."""
         text = self.pending_text
-        for i in range(end - 1, -1, -1):
-            if text[i] == " ":
+        i = 0
+        while i < limit:
+            if text[i] == "<" and i + 1 == len(text) and not final:
+                # The next token delta may turn this into an <|...|> control.
                 return i
-        return None
+            if text[i] == "[":
+                closing = text.find("]", i + 1)
+                stop = closing + 1 if closing >= 0 else len(text) + 1
+            elif text.startswith("<|", i):
+                closing = text.find("|>", i + 2)
+                stop = closing + 2 if closing >= 0 else len(text) + 1
+            else:
+                i += 1
+                continue
+            if stop > limit:
+                if final and closing < 0 and len(text) <= limit:
+                    # Unclosed ordinary prose brackets at EOF remain literal.
+                    return limit
+                return i
+            i = stop
+        return limit
 
-    def _commit_word_boundary(self, search_end: int) -> Optional[str]:
-        pos = self._best_word_boundary_before(search_end)
-        if pos is None:
-            # No space found — hard split at search_end
-            pos = search_end
-        return self._commit_at(pos + 1)
+    def _word_end(self, limit: int) -> int:
+        # At the actual end there is nothing to split or save for later.
+        if limit == len(self.pending_text):
+            return limit
+        for end in range(limit, 0, -1):
+            if self.pending_text[end - 1].isspace() and self._safe_end(end) == end:
+                return end
+        return limit
 
-    def _commit_at(self, end: int) -> Optional[str]:
+    def _commit(self, end: int) -> str | None:
         chunk = self.pending_text[:end].strip()
         self.pending_text = self.pending_text[end:].lstrip()
-        return chunk if chunk else None
+        return chunk or None
