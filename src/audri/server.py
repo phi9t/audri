@@ -90,6 +90,10 @@ class _OwnedStreamingResponse(StreamingResponse):
             try:
                 async with asyncio.timeout(self._send_timeout_s):
                     await send(message)
+            except TimeoutError:
+                # TimeoutError is an OSError subclass. A stalled sender must
+                # remain an observable timeout, not become a normal disconnect.
+                raise
             except OSError as exc:
                 # ASGI 2.4 reports a closed connection from send(). Keep this
                 # distinct from an OSError raised by the audio backend itself.

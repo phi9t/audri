@@ -98,8 +98,10 @@ printf 'Hello. This text can also come from an LLM token producer.\n' | \
 
 For long-form text already available as one complete script, `speak --stdin`
 lets the model service manage the entire generation. Streaming text sessions
-commit several independent requests; inline speaker/style context and a
-consistent voice reference should be provided for the whole session.
+commit several independent requests. Request-level instructions and references
+are applied to every chunk; inline speaker/style state is not automatically
+carried from one request to the next. Send a complete multi-speaker script with
+`speak` when it needs the model to retain context across that passage.
 
 ## Python API
 

@@ -355,21 +355,36 @@ class DisconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_stalled_http_sender_times_out_and_releases_slot(self):
         import httpx
 
-        driver = SlowDriver()
-        app = create_app(driver, max_sessions=1, limits=ServerLimits(send_timeout_s=0.02))
-        incoming = asyncio.Queue()
-        await incoming.put({"type": "http.request", "body": b'{"input":"hello","response_format":"pcm"}', "more_body": False})
+        for spec_version in ("2.0", "2.4"):
+            with self.subTest(spec_version=spec_version):
+                driver = SlowDriver()
+                app = create_app(driver, max_sessions=1, limits=ServerLimits(send_timeout_s=0.02))
+                incoming = asyncio.Queue()
+                await incoming.put({"type": "http.request", "body": b'{"input":"hello","response_format":"pcm"}', "more_body": False})
+                send_started = asyncio.Event()
+                send_cancelled = asyncio.Event()
 
-        async def send(message):
-            if message["type"] == "http.response.body":
-                await asyncio.Event().wait()
+                async def send(message):
+                    if message["type"] == "http.response.body":
+                        send_started.set()
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            send_cancelled.set()
 
-        with self.assertRaises((TimeoutError, BaseExceptionGroup)):
-            await asyncio.wait_for(app(self.scope(), incoming.get, send), 2)
-        self.assertEqual(driver.cleaned, 1)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/health")
-            self.assertEqual(response.json()["active_sessions"], 0)
+                started = asyncio.get_running_loop().time()
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(app(self.scope(spec_version), incoming.get, send), 2)
+                elapsed = asyncio.get_running_loop().time() - started
+                self.assertTrue(send_started.is_set())
+                self.assertTrue(send_cancelled.is_set())
+                # Prove this was the configured send deadline, not wait_for's
+                # two-second test watchdog. No disconnect is ever enqueued.
+                self.assertLess(elapsed, 1)
+                self.assertEqual(driver.cleaned, 1)
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                    response = await client.get("/health")
+                    self.assertEqual(response.json()["active_sessions"], 0)
 
 
 if __name__ == "__main__":

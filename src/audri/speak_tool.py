@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from collections.abc import Callable
 
 from .tts.audio_egress import AudioEgress, LocalAudioEgress, NullAudioEgress
 from .tts.chunker import ChunkerConfig
 from .tts.driver import TTSDriver
-from .tts.session import SessionConfig, SessionMetrics, SpeechSession
+from .tts.session import (
+    SessionClosedError, SessionConfig, SessionMetrics, SessionState, SpeechSession,
+)
 from .tts.types import SynthesisRequest
 
 
@@ -20,6 +23,9 @@ class SpeakTool:
     idempotent and isolates cancellation. Use an async context manager or
     call ``aclose`` to clean up if a producer fails. Set close_driver=False
     when another owner manages the supplied backend's lifetime.
+
+    Sink teardown callbacks may stop or replace other sessions. They must not
+    await this manager's ``aclose``: shutdown waits for those callbacks to exit.
     """
 
     def __init__(
@@ -47,6 +53,7 @@ class SpeakTool:
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+        self._retiring: dict[SpeechSession, asyncio.Task[SessionMetrics]] = {}
 
     async def __aenter__(self) -> SpeakTool:
         if self._closed:
@@ -66,35 +73,85 @@ class SpeakTool:
         request: SynthesisRequest | None = None,
         egress: AudioEgress | None = None,
     ) -> SpeechSession:
-        """Create a session, replacing an earlier generation of the same ID."""
-        async with self._lifecycle_lock:
-            if self._closed:
-                raise RuntimeError("SpeakTool is closed")
-            previous = self.sessions.pop(session_id, None)
-            if previous is not None:
-                await previous.cancel()
-            if len(self.sessions) >= self.max_sessions:
-                raise RuntimeError(f"maximum active sessions reached ({self.max_sessions})")
-            session = SpeechSession(
-                session_id=session_id,
-                voice=voice,
-                language=language,
-                driver=self.driver,
-                egress=egress if egress is not None else self.egress_factory(),
-                chunker_config=self.chunker_config,
-                instruction=instruction,
-                config=self.session_config,
-                request=request,
-            )
-            session.start()
-            self.sessions[session_id] = session
+        """Replace a generation; the last admitted concurrent start wins.
+
+        Reserve the new generation before awaiting old sink teardown. A
+        callback can therefore stop or replace the reservation without a lock
+        cycle. A superseded start raises SessionClosedError and cannot later
+        install an orphan session. Await start before sending its first delta.
+        """
+        if self._closed:
+            raise RuntimeError("SpeakTool is closed")
+        # Factories may run application code; never invoke them under a lock.
+        session = SpeechSession(
+            session_id=session_id,
+            voice=voice,
+            language=language,
+            driver=self.driver,
+            egress=egress if egress is not None else self.egress_factory(),
+            chunker_config=self.chunker_config,
+            instruction=instruction,
+            config=self.session_config,
+            request=request,
+        )
+        try:
+            async with self._lifecycle_lock:
+                if self._closed:
+                    raise RuntimeError("SpeakTool is closed")
+                previous = self.sessions.get(session_id)
+                if previous is None and len(self.sessions) >= self.max_sessions:
+                    raise RuntimeError(f"maximum active sessions reached ({self.max_sessions})")
+                self.sessions[session_id] = session
+                retirement = self._retire(previous) if previous is not None else None
+            if retirement is not None:
+                await asyncio.shield(retirement)
+            async with self._lifecycle_lock:
+                if self._closed:
+                    raise RuntimeError("SpeakTool closed during session startup")
+                if self.sessions.get(session_id) is not session:
+                    raise SessionClosedError(f"start for {session_id!r} was superseded")
+                session.start()
             return session
+        except BaseException:
+            async with self._lifecycle_lock:
+                if self.sessions.get(session_id) is session:
+                    self.sessions.pop(session_id)
+                retirement = self._retire(session)
+            # Cleanup is independently owned and survives caller cancellation.
+            # Retain the startup error if the sink also fails while aborting.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(retirement)
+            raise
+
+    def _retire(self, session: SpeechSession) -> asyncio.Task[SessionMetrics]:
+        """Register cleanup under the lock; the task runs after it is released."""
+        task = self._retiring.get(session)
+        if task is None:
+            async def cancel_after_unlock() -> SessionMetrics:
+                # Also defer application callbacks with an eager task factory.
+                await asyncio.sleep(0)
+                return await session.cancel()
+
+            task = asyncio.create_task(cancel_after_unlock())
+            self._retiring[session] = task
+
+            def completed(done: asyncio.Task[SessionMetrics]) -> None:
+                if self._retiring.get(session) is done:
+                    self._retiring.pop(session)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(completed)
+        return task
 
     def _get_session(self, session_id: str) -> SpeechSession:
         try:
-            return self.sessions[session_id]
+            session = self.sessions[session_id]
         except KeyError:
             raise KeyError(f"unknown speech session {session_id!r}") from None
+        if session.state is SessionState.IDLE:
+            raise SessionClosedError("session startup is pending; await start before sending input")
+        return session
 
     async def delta(self, session_id: str, text_delta: str, is_final: bool = False) -> None:
         await self._get_session(session_id).push_delta(text_delta, is_final=is_final)
@@ -113,7 +170,8 @@ class SpeakTool:
             session = self.sessions.pop(session_id, None)
             if session is None:
                 return None
-            return await session.cancel()
+            retirement = self._retire(session)
+        return await asyncio.shield(retirement)
 
     async def aclose(self) -> None:
         async with self._lifecycle_lock:
@@ -121,7 +179,12 @@ class SpeakTool:
                 self._closed = True
                 sessions = list(self.sessions.values())
                 self.sessions.clear()
-                self._close_task = asyncio.create_task(self._shutdown(sessions))
+                for session in sessions:
+                    self._retire(session)
+                # Include sessions already detached by an in-flight stop or
+                # replacement; their sink callbacks may still own resources.
+                retirements = list(self._retiring.values())
+                self._close_task = asyncio.create_task(self._shutdown(retirements))
                 # Consume background exceptions if the caller is cancelled;
                 # a later aclose still awaits and raises the stored exception.
                 self._close_task.add_done_callback(
@@ -129,10 +192,9 @@ class SpeakTool:
                 )
         await asyncio.shield(self._close_task)
 
-    async def _shutdown(self, sessions: list[SpeechSession]) -> None:
-        results = await asyncio.gather(
-            *(session.cancel() for session in sessions), return_exceptions=True
-        )
+    async def _shutdown(self, retirements: list[asyncio.Task[SessionMetrics]]) -> None:
+        await asyncio.sleep(0)  # Keep driver teardown outside the lock even with eager tasks.
+        results = await asyncio.gather(*retirements, return_exceptions=True)
         errors = [result for result in results if isinstance(result, Exception)]
         try:
             if self.close_driver:

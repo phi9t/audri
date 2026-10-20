@@ -74,6 +74,13 @@ replacement session with the same identifier has a separate generation; the
 old generation's cleanup cannot remove the new one. Independent sessions never
 share a cancellation flag.
 
+Concurrent starts for one identifier use the last reservation. A superseded
+start raises `SessionClosedError`; await `start` before sending input. Sink
+cleanup runs outside the manager lock, so callbacks can stop other sessions.
+A cleanup callback must not await the enclosing manager's own shutdown: that
+shutdown waits for the callback to return. Schedule it from the application
+owner instead.
+
 The application must call `end` or `stop`, or close its `SpeakTool`. Use an async
 context manager so a failed text producer also releases the audio session.
 `close_driver=False` is for nested managers whose backend has another owner.
@@ -99,6 +106,8 @@ hard kill of a stuck GPU call.
 `abort()` means discard buffered output. The queue sink signals termination out
 of band, so it does not require a spare queue slot to shut down. Callback sinks
 await async callbacks; synchronous callbacks should be short.
+Cancelling an individual queue read leaves its pending frame available to a
+later reader; aborting the sink deliberately discards buffered frames.
 
 The WAV sink writes a temporary file alongside the destination and only
 publishes after finalizing the header. Abort removes the partial file. Existing

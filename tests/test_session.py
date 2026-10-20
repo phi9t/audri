@@ -75,6 +75,15 @@ def session(driver=None, sink=None, **kwargs):
     )
 
 
+async def wait_for_blocked_put(item):
+    async with asyncio.timeout(1):
+        while not (
+            item._delta_queue.full()
+            and any(not task.done() for task in item._pending_puts)
+        ):
+            await asyncio.sleep(.001)
+
+
 class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_ordered_bounded_chunks_and_metrics(self):
         driver = RecordingDriver()
@@ -197,7 +206,12 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_blocked_producer_wakes_on_cancel(self):
         driver = GatedDriver()
-        item = session(driver, config=SessionConfig(
+        terminal_chars = []
+        sink = CallbackAudioEgress(
+            lambda frame: None,
+            on_abort=lambda: terminal_chars.append(item.metrics.input_chars),
+        )
+        item = session(driver, sink, config=SessionConfig(
             delta_queue_size=1, text_queue_size=1, audio_queue_size=1
         ))
         item.start()
@@ -208,13 +222,19 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
         producer = asyncio.create_task(produce())
         await asyncio.wait_for(driver.started.wait(), 1)
-        await asyncio.sleep(.02)
+        await wait_for_blocked_put(item)
         self.assertFalse(producer.done())
         await asyncio.wait_for(item.cancel(), 1)
         with self.assertRaises(SessionClosedError):
             await asyncio.wait_for(producer, 1)
         self.assertLessEqual(item.metrics.delta_queue_highwater, 1)
         self.assertLessEqual(item.metrics.text_queue_highwater, 1)
+        await asyncio.sleep(0)
+        self.assertEqual(terminal_chars, [item.metrics.input_chars])
+        self.assertTrue(item._delta_queue.empty())
+        self.assertTrue(item._commit_queue.empty())
+        self.assertTrue(item._audio_queue.empty())
+        self.assertEqual(item._pending_puts, set())
 
     async def test_blocked_producer_wakes_on_failure(self):
         fail = asyncio.Event()
@@ -227,7 +247,12 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 yield FRAME
 
         driver = LaterFailure()
-        item = session(driver, config=SessionConfig(delta_queue_size=1, text_queue_size=1))
+        terminal_chars = []
+        sink = CallbackAudioEgress(
+            lambda frame: None,
+            on_abort=lambda: terminal_chars.append(item.metrics.input_chars),
+        )
+        item = session(driver, sink, config=SessionConfig(delta_queue_size=1, text_queue_size=1))
         item.start()
 
         async def produce():
@@ -236,20 +261,44 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
         producer = asyncio.create_task(produce())
         await asyncio.wait_for(driver.started.wait(), 1)
-        await asyncio.sleep(.01)
+        await wait_for_blocked_put(item)
         fail.set()
         with self.assertRaisesRegex(OSError, "model crashed"):
             await asyncio.wait_for(producer, 1)
         with self.assertRaises(OSError):
             await item.wait()
+        await asyncio.sleep(0)
+        self.assertEqual(terminal_chars, [item.metrics.input_chars])
+        self.assertTrue(item._delta_queue.empty())
+        self.assertTrue(item._commit_queue.empty())
+        self.assertTrue(item._audio_queue.empty())
+        self.assertEqual(item._pending_puts, set())
 
     async def test_finish_caller_cancellation_stops_session(self):
         driver = GatedDriver()
         item = session(driver)
         item.start()
         await item.push_delta("Sentence.")
+        await asyncio.wait_for(driver.started.wait(), 1)
+        # Hold input admission so finish blocks while finalizing, before wait.
+        # Cancelling a task before it ever starts cannot execute its cleanup.
+        async with item._input_lock:
+            finisher = asyncio.create_task(item.finish())
+            await asyncio.sleep(0)
+            self.assertFalse(finisher.done())
+            finisher.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(finisher, 1)
+        self.assertEqual(item.state, SessionState.CANCELLED)
+
+    async def test_finish_wait_cancellation_stops_session(self):
+        driver = GatedDriver()
+        item = session(driver)
+        item.start()
+        await item.push_delta("Sentence.", is_final=True)
+        await asyncio.wait_for(driver.started.wait(), 1)
         finisher = asyncio.create_task(item.finish())
-        await driver.started.wait()
+        await asyncio.sleep(0)  # Enter finish's wait before cancelling it.
         finisher.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await asyncio.wait_for(finisher, 1)
@@ -325,6 +374,133 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_abort_callback_can_stop_another_session(self):
+        async with SpeakTool(RecordingDriver(), egress_factory=NullAudioEgress) as tool:
+            stopped = []
+
+            async def on_abort():
+                stopped.append(await tool.stop("B"))
+
+            first = await tool.start("A", egress=CallbackAudioEgress(lambda frame: None, on_abort=on_abort))
+            second = await tool.start("B")
+            await asyncio.wait_for(tool.stop("A"), 1)
+            self.assertEqual(first.state, SessionState.CANCELLED)
+            self.assertEqual(second.state, SessionState.CANCELLED)
+            self.assertEqual(len(stopped), 1)
+            self.assertEqual(tool.sessions, {})
+
+    async def test_replacement_abort_callback_can_stop_another_session(self):
+        async with SpeakTool(RecordingDriver(), egress_factory=NullAudioEgress) as tool:
+            async def on_abort():
+                await tool.stop("B")
+
+            original = await tool.start("A", egress=CallbackAudioEgress(lambda frame: None, on_abort=on_abort))
+            second = await tool.start("B")
+            replacement = await asyncio.wait_for(tool.start("A"), 1)
+            self.assertIs(tool.sessions["A"], replacement)
+            self.assertEqual(original.state, SessionState.CANCELLED)
+            self.assertEqual(second.state, SessionState.CANCELLED)
+
+    async def test_same_id_reentrant_start_supersedes_reservation_without_deadlock(self):
+        async with SpeakTool(RecordingDriver(), egress_factory=NullAudioEgress) as tool:
+            nested = []
+
+            async def on_abort():
+                nested.append(await tool.start("same"))
+
+            original = await tool.start("same", egress=CallbackAudioEgress(lambda frame: None, on_abort=on_abort))
+            with self.assertRaisesRegex(SessionClosedError, "superseded"):
+                await asyncio.wait_for(tool.start("same"), 1)
+            self.assertEqual(original.state, SessionState.CANCELLED)
+            self.assertEqual(len(nested), 1)
+            self.assertIs(tool.sessions["same"], nested[0])
+            self.assertEqual(nested[0].state, SessionState.BUFFERING)
+
+    async def test_last_concurrent_start_wins_without_resurrecting_older_one(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_abort():
+            entered.set()
+            await release.wait()
+
+        async with SpeakTool(RecordingDriver(), egress_factory=NullAudioEgress) as tool:
+            await tool.start("same", egress=CallbackAudioEgress(lambda frame: None, on_abort=on_abort))
+            older = asyncio.create_task(tool.start("same"))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                reserved = tool.sessions["same"]
+                newest = await asyncio.wait_for(tool.start("same"), 1)
+                self.assertIs(tool.sessions["same"], newest)
+                self.assertEqual(reserved.state, SessionState.CANCELLED)
+                release.set()
+                with self.assertRaisesRegex(SessionClosedError, "superseded"):
+                    await asyncio.wait_for(older, 1)
+                self.assertIs(tool.sessions["same"], newest)
+            finally:
+                release.set()
+                await asyncio.gather(older, return_exceptions=True)
+
+    async def test_close_waits_for_detached_stop_cleanup(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_abort():
+            entered.set()
+            await release.wait()
+
+        driver = RecordingDriver()
+        tool = SpeakTool(driver, egress_factory=NullAudioEgress)
+        await tool.start("A", egress=CallbackAudioEgress(lambda frame: None, on_abort=on_abort))
+        stopping = asyncio.create_task(tool.stop("A"))
+        closing = None
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            closing = asyncio.create_task(tool.aclose())
+            await asyncio.sleep(.01)
+            self.assertFalse(closing.done())
+            self.assertFalse(driver.closed)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(stopping, closing), 1)
+            self.assertTrue(driver.closed)
+        finally:
+            release.set()
+            tasks = [stopping] + ([closing] if closing is not None else [])
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await tool.aclose()
+
+    async def test_close_during_replacement_cannot_install_new_session(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_abort():
+            entered.set()
+            await release.wait()
+
+        driver = RecordingDriver()
+        tool = SpeakTool(driver, egress_factory=NullAudioEgress)
+        await tool.start("same", egress=CallbackAudioEgress(lambda frame: None, on_abort=on_abort))
+        starting = asyncio.create_task(tool.start("same"))
+        closing = None
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            reserved = tool.sessions["same"]
+            closing = asyncio.create_task(tool.aclose())
+            await asyncio.sleep(.01)
+            self.assertFalse(closing.done())
+            release.set()
+            with self.assertRaisesRegex(RuntimeError, "closed during"):
+                await asyncio.wait_for(starting, 1)
+            await asyncio.wait_for(closing, 1)
+            self.assertEqual(reserved.state, SessionState.CANCELLED)
+            self.assertEqual(tool.sessions, {})
+            self.assertTrue(driver.closed)
+        finally:
+            release.set()
+            tasks = [starting] + ([closing] if closing is not None else [])
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await tool.aclose()
+
     async def test_sessions_do_not_share_cancellation(self):
         driver = RecordingDriver(frames=20, delay=.002)
         async with SpeakTool(driver, CHUNKER, NullAudioEgress) as tool:

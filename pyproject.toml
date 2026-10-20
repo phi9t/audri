@@ -20,8 +20,8 @@ audri = "audri.cli:main"
 fish = ["httpx>=0.28.1,<0.29"]
 server = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1"]
 playback = ["sounddevice>=0.5,<0.6"]
-# Install TTS inference stack outside the hermetic container environment.
-# Inside the container, use `just build-env` instead.
+# For a separate model container, not the CPU client or the Spack environment.
+# The existing Zephyr container uses `just build-env` instead of this extra.
 tts = [
     "numpy>=2.0",
     "torch>=2.0",

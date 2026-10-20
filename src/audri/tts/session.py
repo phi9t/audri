@@ -143,6 +143,8 @@ class SpeechSession:
             maxsize=self.config.audio_queue_size
         )
         self._input_lock = asyncio.Lock()
+        self._input_closed = asyncio.Event()
+        self._pending_puts: set[asyncio.Task[None]] = set()
         self._finished = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self._error: BaseException | None = None
@@ -169,8 +171,17 @@ class SpeechSession:
             raise self._error
         raise SessionClosedError(f"session {self.session_id!r} is {self.state.value}")
 
+    def _close_input(self) -> None:
+        """Close admission before draining can wake a blocked Queue.put."""
+        self._input_closed.set()
+        for put in tuple(self._pending_puts):
+            if not put.done():
+                put.cancel()
+
     async def _put_delta(self, value: tuple[str, bool]) -> None:
         async def accept() -> None:
+            if self._input_closed.is_set():
+                self._raise_closed()
             await self._delta_queue.put(value)
             # These updates cannot be interrupted after queue acceptance.
             # In particular a caller cancelled at this point cannot enqueue
@@ -182,19 +193,21 @@ class SpeechSession:
             )
 
         put = asyncio.create_task(accept())
-        finished = asyncio.create_task(self._finished.wait())
+        self._pending_puts.add(put)
+        closed = asyncio.create_task(self._input_closed.wait())
         try:
-            await asyncio.wait((put, finished), return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait((put, closed), return_when=asyncio.FIRST_COMPLETED)
             if self._cancel_requested or (
-                self._finished.is_set() and self.state is not SessionState.DONE
+                self._input_closed.is_set() and self.state is not SessionState.DONE
             ):
                 self._raise_closed()
             await put
         finally:
-            for task in (put, finished):
+            for task in (put, closed):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(put, finished, return_exceptions=True)
+            await asyncio.gather(put, closed, return_exceptions=True)
+            self._pending_puts.discard(put)
 
     async def push_delta(self, text: str, is_final: bool = False) -> None:
         if not isinstance(text, str):
@@ -212,7 +225,7 @@ class SpeechSession:
                 if self._error is not None:
                     raise self._error
                 return
-            if self._finished.is_set() or self._cancel_requested:
+            if self._input_closed.is_set() or self._cancel_requested:
                 self._raise_closed()
             if self._finalized:
                 raise SessionClosedError("input is already finalized")
@@ -253,10 +266,13 @@ class SpeechSession:
         No shared driver-global cancellation hook is called. A provider may
         continue remote GPU work after its transport has been closed.
         """
+        if self._finished.is_set():
+            return self.metrics
         if self._runner is None:
             self._cancel_requested = True
             self.cancel_token.cancel()
             self._set_state(SessionState.CANCELLED)
+            self._close_input()
             await self.egress.abort()
             self._finished.set()
             return self.metrics
@@ -264,6 +280,7 @@ class SpeechSession:
             self._cancel_requested = True
             self._set_state(SessionState.CANCELLING)
             self.cancel_token.cancel()
+            self._close_input()
             self._runner.cancel()
         try:
             await asyncio.shield(self._runner)
@@ -278,6 +295,7 @@ class SpeechSession:
     async def _complete_early_cancel(self) -> None:
         if self._finished.is_set():
             return
+        self._close_input()
         await self.egress.abort()
         self._drain_queues()
         self._set_state(SessionState.CANCELLED)
@@ -311,6 +329,10 @@ class SpeechSession:
             self.metrics.error = f"{type(self._error).__name__}: {self._error}"
             self._set_state(SessionState.FAILED)
         finally:
+            # Cancel pending accepts before any await or final drain. Otherwise
+            # freeing a queue slot lets an already-blocked put enqueue *after*
+            # teardown, retaining text and incrementing terminal metrics.
+            self._close_input()
             if self.state is not SessionState.DONE:
                 try:
                     await self.egress.abort()
