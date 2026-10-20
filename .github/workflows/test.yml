@@ -32,6 +32,13 @@ jobs:
           docker run --rm audri-client --help
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/outputs:/artifacts" audri-client speak 'Framework diagnostic, not speech.' --backend tone --output /artifacts/diagnostic.wav
           docker run --rm audri-tests cat uv.lock > outputs/uv.lock
+      - name: Exercise the packaged HTTP service over a real socket
+        run: |
+          docker run --detach --name audri-api --publish 127.0.0.1:8765:8765 audri-client serve --backend tone --host 0.0.0.0 --port 8765
+          trap 'docker rm --force audri-api >/dev/null' EXIT
+          curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:8765/health
+          curl --fail --silent --show-error http://127.0.0.1:8765/v1/audio/speech -H 'Content-Type: application/json' -d '{"input":"Container API diagnostic.","response_format":"wav"}' --output outputs/api-diagnostic.wav
+          docker run --rm -v "$PWD/outputs:/artifacts:ro" --entrypoint python audri-client -c 'import wave; w = wave.open("/artifacts/api-diagnostic.wav"); assert w.getnframes() > 0 and w.getsampwidth() == 2; print("Packaged HTTP service returned valid PCM16 WAV")'
       - name: Retain diagnostic audio and resolved client environment
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

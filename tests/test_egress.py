@@ -148,6 +148,46 @@ class SinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(await anext(sink), FRAME)
         await sink.abort()
 
+    async def test_queue_consumed_child_get_cancellation_cannot_lose_frame(self):
+        """Cancel exactly after a child get consumes but before its parent resumes.
+
+        The former implementation delegated dequeue to a child task; this hook
+        deterministically exposed its lost-frame window. A reader that dequeues
+        in its own task never enters that window and directly receives FRAME.
+        """
+        sink = QueueAudioEgress(maxsize=1)
+        original_get = sink.queue.get
+
+        async def get_then_cancel_reader():
+            frame = await original_get()
+            reader.cancel()
+            return frame
+
+        with patch.object(sink.queue, "get", get_then_cancel_reader):
+            reader = asyncio.create_task(anext(sink))
+            try:
+                await asyncio.sleep(0)
+                await sink.write(FRAME)
+                try:
+                    received = await asyncio.wait_for(reader, 1)
+                except asyncio.CancelledError:
+                    received = await asyncio.wait_for(anext(sink), 1)
+                self.assertIs(received, FRAME)
+                self.assertEqual(sink.queue.qsize(), 0)
+            finally:
+                if not reader.done():
+                    reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+                await sink.abort()
+
+    async def test_queue_external_put_wakes_iterator(self):
+        sink = QueueAudioEgress(maxsize=1)
+        reader = asyncio.create_task(anext(sink))
+        await asyncio.sleep(0)
+        await sink.queue.put(FRAME)
+        self.assertIs(await asyncio.wait_for(reader, 1), FRAME)
+        await sink.close()
+
     async def test_playback_lazily_uses_negotiated_format_and_abort(self):
         fake = MagicMock()
         device = fake.RawOutputStream.return_value

@@ -87,22 +87,55 @@ class _OwnedStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope, receive, send):
         async def bounded_send(message):
-            async with asyncio.timeout(self._send_timeout_s):
-                await send(message)
+            try:
+                async with asyncio.timeout(self._send_timeout_s):
+                    await send(message)
+            except OSError as exc:
+                # ASGI 2.4 reports a closed connection from send(). Keep this
+                # distinct from an OSError raised by the audio backend itself.
+                raise _Disconnected() from exc
 
+        # Starlette's ASGI >= 2.4 path only detects disconnect when send raises.
+        # A backend waiting for its next frame may never call send again. Own a
+        # receive watcher for every ASGI version so that this pending operation
+        # is cancelled too. The request body was fully consumed before entry.
+        sender = asyncio.create_task(self.stream_response(bounded_send))
+        watcher = asyncio.create_task(self.listen_for_disconnect(receive))
         try:
-            await super().__call__(scope, receive, bounded_send)
+            done, _ = await asyncio.wait((sender, watcher), return_when=asyncio.FIRST_COMPLETED)
+            if sender in done:
+                try:
+                    await sender
+                except _Disconnected:
+                    pass
+            else:
+                await watcher
         finally:
-            # Starlette cancels an AnyIO scope after disconnect. Shield this
-            # teardown from its repeated cancellation while still bounding a
-            # misbehaving iterator's close operation.
+            # First stop the task advancing the iterator, then close it. Closing
+            # a generator while anext() is still pending raises RuntimeError and
+            # can strand its underlying HTTP response or admission slot.
             with anyio.CancelScope(shield=True):
                 try:
-                    if hasattr(self.body_iterator, "aclose"):
-                        async with asyncio.timeout(5):
-                            await self.body_iterator.aclose()
+                    await _cancel_and_join(sender, watcher)
                 finally:
-                    await self._cleanup()
+                    try:
+                        if hasattr(self.body_iterator, "aclose"):
+                            async with asyncio.timeout(5):
+                                await self.body_iterator.aclose()
+                    finally:
+                        await self._cleanup()
+        if self.background is not None:
+            await self.background()
+
+
+async def _cancel_and_join(*tasks):
+    """Retire owned tasks without leaving a blocked ASGI receive behind."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    with anyio.CancelScope(shield=True):
+        async with asyncio.timeout(5):
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _authorized(header: str | None, key: str | None) -> bool:
@@ -209,10 +242,14 @@ async def _until_disconnect(request, operation, token):
 
     async def watch():
         while True:
-            if await request.is_disconnected():
+            # The body has already been consumed. Wait for the actual ASGI
+            # disconnect instead of polling Request.is_disconnected(): its
+            # internally cancelled AnyIO scope can swallow this watcher's
+            # task.cancel(), making the join below wait forever.
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
                 token.cancel()
                 raise _Disconnected()
-            await asyncio.sleep(0.05)
 
     task = asyncio.create_task(invoke())
     watcher = asyncio.create_task(watch())
@@ -223,10 +260,7 @@ async def _until_disconnect(request, operation, token):
         await watcher
         raise AssertionError("disconnect watcher unexpectedly completed")
     finally:
-        for pending in (task, watcher):
-            if not pending.done():
-                pending.cancel()
-        await asyncio.gather(task, watcher, return_exceptions=True)
+        await _cancel_and_join(task, watcher)
 
 
 def _http_exception(exc: Exception) -> HTTPException:

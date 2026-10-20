@@ -16,6 +16,16 @@ class WatchedResult(unittest.TextTestResult):
         faulthandler.cancel_dump_traceback_later()
         super().stopTest(test)
 
+    def addError(self, test, err):
+        super().addError(test, err)
+        # Preserve the first failure even if a later concurrency regression
+        # triggers the process watchdog before unittest's final summary.
+        self.stream.writeln(self._exc_info_to_string(err, test))
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self.stream.writeln(self._exc_info_to_string(err, test))
+
 
 if __name__ == "__main__":
     faulthandler.enable()

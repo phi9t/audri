@@ -209,9 +209,9 @@ class ServerTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_SERVER, "optional server dependencies are unavailable")
 class DisconnectTests(unittest.IsolatedAsyncioTestCase):
-    def scope(self):
+    def scope(self, spec_version="2.0"):
         return {
-            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.0"},
+            "type": "http", "asgi": {"version": "3.0", "spec_version": spec_version},
             "http_version": "1.1", "method": "POST", "scheme": "http",
             "path": "/v1/audio/speech", "raw_path": b"/v1/audio/speech",
             "query_string": b"", "root_path": "", "headers": [(b"content-type", b"application/json")],
@@ -219,20 +219,108 @@ class DisconnectTests(unittest.IsolatedAsyncioTestCase):
         }
 
     async def test_pcm_disconnect_closes_pending_backend_iterator(self):
-        driver = SlowDriver()
+        import httpx
+
+        for spec_version in ("2.0", "2.4"):
+            with self.subTest(spec_version=spec_version):
+                driver = SlowDriver()
+                app = create_app(driver)
+                incoming = asyncio.Queue()
+                await incoming.put({"type": "http.request", "body": b'{"input":"hello","response_format":"pcm"}', "more_body": False})
+                received = []
+
+                async def send(message):
+                    received.append(message)
+                    if message["type"] == "http.response.body" and message.get("body"):
+                        await incoming.put({"type": "http.disconnect"})
+
+                await asyncio.wait_for(app(self.scope(spec_version), incoming.get, send), 2)
+                self.assertEqual(driver.cleaned, 1)
+                self.assertTrue(any(item["type"] == "http.response.body" and item.get("body") == driver.pcm for item in received))
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                    self.assertEqual((await client.get("/health")).json()["active_sessions"], 0)
+
+    async def test_backend_failure_does_not_wait_for_response_disconnect(self):
+        """A failure before headers must retire the pending receive watcher."""
+        import httpx
+
+        driver = FailingDriver()
         app = create_app(driver)
         incoming = asyncio.Queue()
-        await incoming.put({"type": "http.request", "body": b'{"input":"hello","response_format":"pcm"}', "more_body": False})
+        await incoming.put({"type": "http.request", "body": b'{"input":"hello"}', "more_body": False})
         received = []
 
         async def send(message):
             received.append(message)
-            if message["type"] == "http.response.body" and message.get("body"):
-                await incoming.put({"type": "http.disconnect"})
 
+        # No http.disconnect is ever delivered. The error response must still
+        # complete, rather than waiting for a watcher of its own future reply.
         await asyncio.wait_for(app(self.scope(), incoming.get, send), 2)
         self.assertEqual(driver.cleaned, 1)
-        self.assertTrue(any(item["type"] == "http.response.body" and item.get("body") == driver.pcm for item in received))
+        self.assertEqual(received[0]["status"], 502)
+        body = b"".join(message.get("body", b"") for message in received)
+        self.assertNotIn(b"secret-bearing", body)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            self.assertEqual((await client.get("/health")).json()["active_sessions"], 0)
+
+    async def test_success_does_not_wait_for_response_disconnect(self):
+        """Both generation and response watchers must stop after normal EOF."""
+        for response_format in ("wav", "pcm"):
+            with self.subTest(response_format=response_format):
+                driver = RecordingDriver()
+                app = create_app(driver)
+                incoming = asyncio.Queue()
+                body = json.dumps({"input": "hello", "response_format": response_format}).encode()
+                await incoming.put({"type": "http.request", "body": body, "more_body": False})
+                received = []
+
+                async def send(message):
+                    received.append(message)
+
+                await asyncio.wait_for(app(self.scope("2.4"), incoming.get, send), 2)
+                self.assertEqual(received[0]["status"], 200)
+                self.assertFalse(received[-1].get("more_body", False))
+                self.assertEqual(driver.cleaned, 1)
+
+    async def test_send_oserror_is_a_disconnect_and_releases_backend(self):
+        import httpx
+
+        driver = SlowDriver()
+        app = create_app(driver)
+        incoming = asyncio.Queue()
+        await incoming.put({"type": "http.request", "body": b'{"input":"hello","response_format":"pcm"}', "more_body": False})
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("peer disconnected during send")
+
+        await asyncio.wait_for(app(self.scope("2.4"), incoming.get, send), 2)
+        self.assertEqual(driver.cleaned, 1)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            self.assertEqual((await client.get("/health")).json()["active_sessions"], 0)
+
+    async def test_wav_backend_failure_after_first_frame_returns_502(self):
+        class LateFailureDriver(RecordingDriver):
+            async def stream(self, request, *, cancel=None):
+                try:
+                    yield AudioFrame(self.pcm, AudioFormat(44100))
+                    raise RuntimeError("later secret-bearing failure")
+                finally:
+                    self.cleaned += 1
+
+        driver = LateFailureDriver()
+        app = create_app(driver)
+        incoming = asyncio.Queue()
+        await incoming.put({"type": "http.request", "body": b'{"input":"hello"}', "more_body": False})
+        received = []
+
+        async def send(message):
+            received.append(message)
+
+        await asyncio.wait_for(app(self.scope(), incoming.get, send), 2)
+        self.assertEqual(received[0]["status"], 502)
+        self.assertNotIn(b"secret-bearing", b"".join(m.get("body", b"") for m in received))
+        self.assertEqual(driver.cleaned, 1)
 
     async def test_disconnect_before_first_frame_stops_generation(self):
         started = asyncio.Event()

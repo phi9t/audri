@@ -138,6 +138,18 @@ class CallbackAudioEgress(AudioEgress):
             await self._call(self.on_abort)
 
 
+class _NotifyingFrameQueue(asyncio.Queue[AudioFrame]):
+    """Keep queue compatibility while notifying readers without consuming data."""
+
+    def __init__(self, maxsize: int, available: asyncio.Event) -> None:
+        super().__init__(maxsize=maxsize)
+        self._available = available
+
+    def put_nowait(self, item: AudioFrame) -> None:
+        super().put_nowait(item)
+        self._available.set()
+
+
 class QueueAudioEgress(AudioEgress, AsyncIterator[AudioFrame]):
     """Bounded frame iterator with out-of-band EOF and cancellation.
 
@@ -149,7 +161,8 @@ class QueueAudioEgress(AudioEgress, AsyncIterator[AudioFrame]):
         super().__init__()
         if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 1:
             raise ValueError("maxsize must be a positive integer")
-        self.queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=maxsize)
+        self._available = asyncio.Event()
+        self.queue: asyncio.Queue[AudioFrame] = _NotifyingFrameQueue(maxsize, self._available)
         self._ended = asyncio.Event()
 
     async def write(self, frame: AudioFrame) -> None:
@@ -173,28 +186,21 @@ class QueueAudioEgress(AudioEgress, AsyncIterator[AudioFrame]):
         return self
 
     async def __anext__(self) -> AudioFrame:
-        if self.aborted:
-            raise StopAsyncIteration
-        if not self.queue.empty():
-            return self.queue.get_nowait()
-        if self.closed:
-            raise StopAsyncIteration
-        get = asyncio.create_task(self.queue.get())
-        ended = asyncio.create_task(self._ended.wait())
-        try:
-            await asyncio.wait((get, ended), return_when=asyncio.FIRST_COMPLETED)
+        while True:
             if self.aborted:
                 raise StopAsyncIteration
-            if get.done():
-                return get.result()
-            if not self.queue.empty():
+            try:
+                # Dequeue and return in this reader's task without an await
+                # between them. A cancelled availability waiter has never
+                # consumed a frame that a subsequent reader would need.
                 return self.queue.get_nowait()
-            raise StopAsyncIteration
-        finally:
-            for task in (get, ended):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(get, ended, return_exceptions=True)
+            except asyncio.QueueEmpty:
+                if self.closed:
+                    raise StopAsyncIteration
+                # No task can enqueue between the empty check and clear:
+                # both run synchronously on the same event loop.
+                self._available.clear()
+            await self._available.wait()
 
     def _discard(self) -> None:
         while not self.queue.empty():
@@ -203,12 +209,14 @@ class QueueAudioEgress(AudioEgress, AsyncIterator[AudioFrame]):
     async def close(self) -> None:
         self.closed = True
         self._ended.set()
+        self._available.set()
 
     async def abort(self) -> None:
         self.aborted = True
         self.closed = True
         self._discard()
         self._ended.set()
+        self._available.set()
 
 
 class WaveAudioEgress(AudioEgress):

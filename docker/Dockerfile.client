@@ -14,8 +14,8 @@ COPY tests ./tests
 COPY examples ./examples
 COPY scripts/test_framework.py ./scripts/test_framework.py
 RUN uv sync --extra fish --extra server
-RUN timeout 180 python scripts/test_framework.py
 RUN ruff check src tests examples
+RUN timeout 180 python scripts/test_framework.py
 
 FROM base AS runtime
 RUN useradd --uid 10001 --create-home audri
